@@ -763,11 +763,14 @@ class RecordingManager: ObservableObject {
             // The "done" marker carries the saved note's filename so we can offer
             // a correction on exactly this note (not just "the latest").
             if let note, !note.isEmpty { self.lastNoteFile = note }
-            let stageOrder = ["transcribing", "diarizing", "processing", "saving", "done"]
-            if let idx = stageOrder.firstIndex(of: stage), idx > 0 {
-                for i in 0..<idx { self.completedStages.insert(stageOrder[i]) }
+            // Mark every display step *before* the current one done, so collapsed
+            // sub-stages (diarizing/classifying → transcribing) don't prematurely
+            // complete a step or leave a gap with nothing active.
+            let current = Self.displayStepFor[stage] ?? stage
+            if let idx = Self.displayOrder.firstIndex(of: current) {
+                for i in 0..<idx { self.completedStages.insert(Self.displayOrder[i]) }
             }
-            if stage == "done" { self.completedStages.insert("saving") }
+            if stage == "done" { Self.displayOrder.forEach { self.completedStages.insert($0) } }
             if self.processingStage != stage {   // new stage → restart its elapsed clock
                 self.stageStartedAt = Date()
                 self.stageElapsed = 0
@@ -979,9 +982,27 @@ class RecordingManager: ObservableObject {
         return String(format: "%02d:%02d", m, s)
     }
 
-    func stepState(for stage: String) -> StepState {
-        if completedStages.contains(stage) { return .done }
-        if processingStage == stage { return .active }
+    // The Python pipeline emits fine-grained stages (importing, transcribing,
+    // diarizing, classifying, processing, saving, done) but the menu shows three
+    // steps. Diarization and auto-classification are post-transcription work, so
+    // they map back onto "transcribing" — otherwise the Transcribing step reads
+    // as done while Extracting is still pending and *nothing* looks active, which
+    // looks frozen even though pyannote is churning away.
+    static let displayStepFor: [String: String] = [
+        "importing": "transcribing",
+        "transcribing": "transcribing",
+        "diarizing": "transcribing",
+        "classifying": "transcribing",
+        "processing": "processing",
+        "saving": "saving",
+        "done": "done",
+    ]
+    static let displayOrder = ["transcribing", "processing", "saving"]
+
+    func stepState(for step: String) -> StepState {
+        if completedStages.contains(step) { return .done }
+        let current = Self.displayStepFor[processingStage] ?? processingStage
+        if current == step { return .active }
         return .pending
     }
 
