@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from src import config as _config
 from src import notes_index as ni
 from src import brief as brief_mod
 from src import corrections as corr
@@ -35,6 +36,15 @@ templates = Jinja2Templates(directory=os.path.join(_HERE, "templates"))
 
 app = FastAPI(title="Scribe")
 app.mount("/static", StaticFiles(directory=_STATIC), name="static")
+
+
+@app.middleware("http")
+async def _refresh_config(request: Request, call_next):
+    # Pick up config.yaml edits made while the server runs (e.g. the menu bar's
+    # Settings → Identity), so "Mine" vs "Waiting" bucketing stays live without
+    # a restart. A cheap mtime check; only re-reads the file when it changed.
+    _config.maybe_reload()
+    return await call_next(request)
 
 
 @app.get("/favicon.ico", include_in_schema=False)

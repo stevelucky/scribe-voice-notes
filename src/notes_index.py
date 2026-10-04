@@ -132,7 +132,20 @@ def _build_me_matcher():
     return re.compile(rf"\b(?:{pattern})\b", re.IGNORECASE)
 
 
-_ME_MATCHER = _build_me_matcher()
+# The compiled matcher is cached but keyed on the current identity, so if the
+# user edits their name/aliases live (Settings → Identity, which rewrites
+# config.yaml) the next lookup rebuilds it instead of serving a stale match.
+_ME_MATCHER_KEY = None
+_ME_MATCHER = None
+
+
+def _me_matcher():
+    global _ME_MATCHER_KEY, _ME_MATCHER
+    key = tuple(user_identity())
+    if key != _ME_MATCHER_KEY:
+        _ME_MATCHER = _build_me_matcher()
+        _ME_MATCHER_KEY = key
+    return _ME_MATCHER
 
 
 _SPEAKER_LABEL_RE = re.compile(r"^speaker[_ ]?\d+$", re.IGNORECASE)
@@ -144,7 +157,8 @@ def classify_owner(owner: str | None) -> str:
     # Unresolved diarization labels (SPEAKER_00) aren't a real person.
     if o in _UNASSIGNED_TOKENS or _SPEAKER_LABEL_RE.match(o):
         return "unassigned"
-    if _ME_MATCHER and _ME_MATCHER.search(owner or ""):
+    matcher = _me_matcher()
+    if matcher and matcher.search(owner or ""):
         return "mine"
     return "waiting"
 

@@ -157,6 +157,28 @@ def test_confirm_idea_parks_the_item(notes_env):
     assert ni.stats()["open_action_items"] == 0
 
 
+def test_identity_change_rebuilds_mine_matcher_live():
+    """classify_owner reflects a live identity edit (Settings → Identity rewrites
+    config.yaml) without reimporting notes_index — the matcher is keyed on the
+    current identity, not frozen at import."""
+    original = CONFIG.get("user")
+    try:
+        CONFIG["user"] = {"name": "Alice", "aliases": ""}
+        assert ni.classify_owner("Alice") == "mine"
+        assert ni.classify_owner("Bob") == "waiting"
+
+        # User renames themselves (and adds a nickname) while the server runs.
+        CONFIG["user"] = {"name": "Bob", "aliases": "Bobby"}
+        assert ni.classify_owner("Bob") == "mine"
+        assert ni.classify_owner("Bobby") == "mine"
+        assert ni.classify_owner("Alice") == "waiting"
+    finally:
+        if original is None:
+            CONFIG.pop("user", None)
+        else:
+            CONFIG["user"] = original
+
+
 def test_confirm_todo_promotes_to_action_center(notes_env):
     _write_meeting_with_idea("Grab the premium domain")
     me = ni.user_name()
