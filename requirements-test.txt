@@ -1,0 +1,25 @@
+# Dependencies needed to run the pytest suite on a Linux CI runner.
+#
+# The full requirements.txt pulls in Apple-silicon-only packages
+# (mlx-whisper, parakeet-mlx) that cannot pip-install on Linux and are NOT
+# needed for the unit tests — the transcription engines are imported lazily,
+# so none of the tested code paths touch them.
+#
+# Keep this in sync when a test starts importing a new third-party package.
+
+pytest>=8.0
+
+# Core (config, cli, notes_index, output)
+pyyaml>=6.0
+click>=8.1.0
+
+# recorder.py imports these at module load (needs libportaudio2 + libsndfile1
+# system libs on the runner — installed via apt in the workflow)
+numpy>=1.26.0
+sounddevice>=0.5.0
+soundfile>=0.13.0
+
+# test_processor.py patches these SDKs, so they must be importable
+anthropic>=0.40.0
+openai>=1.0.0
+google-genai>=1.0.0

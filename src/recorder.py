@@ -10,6 +10,7 @@ import queue
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import numpy as np
@@ -73,7 +74,7 @@ def _open_stream(sample_rate, channels, callback):
 
 
 class Recorder:
-    def __init__(self, output_path: str = None, on_level=None):
+    def __init__(self, output_path: str = None, on_level=None, on_state=None):
         self._cfg = CONFIG["recording"]
         self._sample_rate = self._cfg["sample_rate"]
         self._channels = self._cfg["channels"]
@@ -82,7 +83,21 @@ class Recorder:
         self._output_path = output_path
         # Optional live-meter callback: receives a list of band levels (0–1).
         self._on_level = on_level
+        # Optional pause-state callback: receives (paused: bool, reason: str).
+        self._on_state = on_state
         self._last_meter = 0.0
+
+        # Silence auto-pause: after this many seconds of continuous silence, stop
+        # writing frames (the file "pauses") until sound returns — so a meeting left
+        # running over a break doesn't bloat into a huge mostly-silent file. 0 = off.
+        self._auto_pause_after = float(self._cfg.get("auto_pause_silence_seconds", 0) or 0)
+        self._silence_level = float(self._cfg.get("auto_pause_level", 0.01) or 0.01)  # RMS
+        self._preroll_seconds = 1.0        # lead-in flushed on resume, so no clipped word
+        self._auto_paused = False
+        self._manual_paused = False
+        self._silence_run = 0.0            # seconds of continuous silence so far
+        self._preroll = deque()            # bounded ring of recent blocks
+        self._preroll_dur = 0.0
         os.makedirs(self._recordings_dir, exist_ok=True)
 
         self._stream = None
@@ -117,9 +132,12 @@ class Recorder:
         if status:
             print(f"[recorder] {status}", file=sys.stderr)
         if self._write_queue is not None:
-            self._write_queue.put(indata.copy())
+            block = indata.copy()
+            if self._decide_write(block, frames):
+                self._write_queue.put(block)
         # Live meter: compute band levels at a throttled rate. Cheap FFT on a
-        # small block; failures here must never disturb recording.
+        # small block; failures here must never disturb recording. Keep running
+        # while paused so the user still sees input (and when sound returns).
         if self._on_level is not None:
             now = time.time()
             if now - self._last_meter >= _METER_INTERVAL:
@@ -130,6 +148,90 @@ class Recorder:
                                                   self._sample_rate))
                 except Exception:
                     pass
+
+    # ─── silence auto-pause + manual pause ──────────────────────────────────
+    # All of this runs on the audio thread (except toggle_manual_pause, called
+    # from a signal handler). Booleans are flipped/read across threads under the
+    # GIL, which is atomic enough here; the write queue is thread-safe.
+
+    def _decide_write(self, block, frames) -> bool:
+        """Whether to write this audio block. Honors a manual pause and a
+        silence-based auto-pause; on resume it flushes a short pre-roll so the
+        first word back is never clipped."""
+        if self._manual_paused:
+            self._push_preroll(block)
+            return False
+        if self._auto_pause_after <= 0:
+            return True  # auto-pause disabled → always write
+
+        try:
+            rms = float(np.sqrt(np.mean(np.square(block, dtype=np.float64)))) if block.size else 0.0
+        except Exception:
+            return True  # on any error, err toward keeping the audio
+        silent = rms < self._silence_level
+
+        if self._auto_paused:
+            self._push_preroll(block)
+            if silent:
+                return False
+            self._auto_paused = False        # sound returned → resume
+            self._silence_run = 0.0
+            self._flush_preroll()
+            self._emit_state("recording")
+            return True
+
+        if silent:
+            self._silence_run += frames / self._sample_rate
+            if self._silence_run >= self._auto_pause_after:
+                self._auto_paused = True
+                self._preroll.clear(); self._preroll_dur = 0.0
+                self._emit_state("silent")
+                return False
+        else:
+            self._silence_run = 0.0
+        return True
+
+    def _push_preroll(self, block):
+        """Keep ~preroll_seconds of the most recent blocks so a resume can flush a
+        lead-in. Blocks are ~equal length, so bound by count."""
+        dur = block.shape[0] / self._sample_rate
+        self._preroll.append(block)
+        self._preroll_dur += dur
+        while self._preroll_dur > self._preroll_seconds and len(self._preroll) > 1:
+            self._preroll.popleft()
+            self._preroll_dur -= dur
+
+    def _flush_preroll(self):
+        if self._write_queue is not None:
+            while self._preroll:
+                self._write_queue.put(self._preroll.popleft())
+        self._preroll.clear()
+        self._preroll_dur = 0.0
+
+    def _emit_state(self, reason: str):
+        if self._on_state is None:
+            return
+        try:
+            self._on_state(self._manual_paused or self._auto_paused, reason)
+        except Exception:
+            pass
+
+    @property
+    def is_paused(self):
+        return self._manual_paused or self._auto_paused
+
+    def toggle_manual_pause(self):
+        """Toggle a deliberate pause (e.g. from the menu bar's Pause button)."""
+        if self._manual_paused:
+            self._manual_paused = False
+            self._flush_preroll()
+            self._emit_state("recording")
+        else:
+            self._manual_paused = True
+            self._auto_paused = False
+            self._silence_run = 0.0
+            self._preroll.clear(); self._preroll_dur = 0.0
+            self._emit_state("manual")
 
     def _writer_loop(self):
         while True:

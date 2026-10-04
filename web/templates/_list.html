@@ -2,7 +2,7 @@
   {% for g in groups %}
   <section class="mb-5 bg-surface rounded-xl shadow-sm border border-line overflow-hidden">
     <div class="px-4 py-3 border-b border-line flex items-baseline justify-between gap-3 bg-paper/40">
-      <a href="/note?file={{ g.note_filename | urlencode }}"
+      <a href="/note?file={{ g.note_filename | urlencode }}&from=actions"
          class="font-display text-lg font-medium text-ink truncate hover:text-accent transition-colors">{{ g.note_title }}</a>
       <span class="font-mono text-xs text-ink-faint whitespace-nowrap">{{ g.note_date }}</span>
     </div>

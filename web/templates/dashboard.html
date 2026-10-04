@@ -7,35 +7,11 @@
   </header>
 
   <div class="sticky top-14 z-20 -mx-5 px-5 pt-2.5 pb-3 bg-paper/90 backdrop-blur border-b border-line">
-    <div class="flex items-baseline justify-between mb-2">
+    <div class="mb-2">
       <p class="text-ink-soft text-sm">
         <span id="stat-open" class="font-mono font-medium text-ink">{{ stats.open_action_items }}</span> open
         across <span id="stat-notes" class="font-mono font-medium text-ink">{{ stats.note_count }}</span> notes
       </p>
-      {% if bucket != 'done' %}
-      <div class="flex items-center gap-3">
-        <span id="selected-count" class="text-sm font-medium text-accent" style="display:none">
-          <span data-selected>0</span> selected
-        </span>
-        <button type="button" id="find-dupes"
-                class="inline-flex items-center gap-1 text-xs font-medium text-accent hover:opacity-80 disabled:opacity-50 transition-opacity"
-                hx-post="/action-items/find-duplicates" hx-include="#filter-form"
-                hx-target="#dupes-panel" hx-swap="innerHTML" hx-disabled-elt="this"
-                hx-indicator="#dupes-indicator"
-                title="Use AI to find duplicate to-dos across meetings">
-          <span class="lbl-idle inline-flex items-center gap-1">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-            </svg>
-            Find duplicates
-          </span>
-          <span class="lbl-busy items-center gap-1">
-            <svg class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.2-8.5"/></svg>
-            Scanning… (~15s)
-          </span>
-        </button>
-      </div>
-      {% endif %}
     </div>
     <div class="flex items-center gap-2 border-b border-line">
       <nav class="flex gap-1 -mb-px flex-1 min-w-0 overflow-x-auto no-scrollbar">
@@ -56,10 +32,22 @@
         {% endfor %}
       </nav>
       {% if bucket != 'done' %}
-      <button type="button" id="clear-completed" onclick="scribeClearCompleted()" disabled
-              class="btn-primary shrink-0 mb-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold shadow-sm"
-              title="Check off items first">
-        <span class="hidden sm:inline">Clear completed →</span><span class="sm:hidden">Clear ✓</span>
+      <button type="button" id="find-dupes"
+              class="shrink-0 mb-1.5 inline-flex items-center gap-1 text-xs font-medium text-accent hover:opacity-80 disabled:opacity-50 transition-opacity"
+              hx-post="/action-items/find-duplicates" hx-include="#filter-form"
+              hx-target="#dupes-panel" hx-swap="innerHTML" hx-disabled-elt="this"
+              hx-indicator="#dupes-indicator"
+              title="Use AI to find duplicate to-dos across meetings">
+        <span class="lbl-idle inline-flex items-center gap-1">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+          </svg>
+          <span class="hidden sm:inline">Find duplicate to-dos</span>
+        </span>
+        <span class="lbl-busy items-center gap-1">
+          <svg class="spin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.2-8.5"/></svg>
+          Scanning… (~15s)
+        </span>
       </button>
       {% endif %}
     </div>

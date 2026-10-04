@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+
+  <header class="mb-7">
+    <p class="font-mono text-xs uppercase tracking-[.12em] text-ink-faint">Long-term ideas</p>
+    <h1 class="mt-1 font-display text-4xl font-semibold tracking-tight text-ink">Someday</h1>
+    <p class="mt-2 text-sm text-ink-soft">Ideas worth keeping but not acting on yet — and anything flagged from your meetings and idea sessions waiting for your call.</p>
+  </header>
+
+  <div id="someday-body">
+    {% include "_someday.html" %}
+  </div>
+
+{% endblock %}

@@ -36,4 +36,38 @@ def load_config():
             cfg["output"][key] = os.path.join(_BASE_DIR, cfg["output"][key])
     return cfg
 
+
+def _config_mtime():
+    try:
+        return os.path.getmtime(_CONFIG_PATH)
+    except OSError:
+        return None
+
+
 CONFIG = load_config()
+_LOADED_MTIME = _config_mtime()
+
+
+def maybe_reload() -> bool:
+    """Re-read config.yaml if it changed on disk since it was last loaded.
+
+    The menu-bar app writes settings (e.g. Settings → Identity) straight to
+    config.yaml while the long-running web server holds an in-memory CONFIG.
+    Calling this lets those edits take effect without a restart. CONFIG is
+    updated in place so existing ``from .config import CONFIG`` references see
+    the new values. Returns True if a reload happened.
+    """
+    global _LOADED_MTIME
+    mtime = _config_mtime()
+    if mtime is None or mtime == _LOADED_MTIME:
+        return False
+    try:
+        fresh = load_config()
+    except Exception:
+        # A half-written file (caught mid-save) — keep the last good config
+        # and try again on the next call once the writer has finished.
+        return False
+    CONFIG.clear()
+    CONFIG.update(fresh)
+    _LOADED_MTIME = mtime
+    return True

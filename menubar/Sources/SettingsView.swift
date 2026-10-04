@@ -6,24 +6,46 @@ struct SettingsView: View {
     @State private var selectedTab = "general"
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            GeneralTab()
-                .tabItem { Label("General", systemImage: "gear") }
-                .tag("general")
+        VStack(spacing: 0) {
+            TabView(selection: $selectedTab) {
+                GeneralTab()
+                    .tabItem { Label("General", systemImage: "gear") }
+                    .tag("general")
 
-            TranscriptionTab()
-                .tabItem { Label("Transcription", systemImage: "waveform") }
-                .tag("transcription")
+                TranscriptionTab()
+                    .tabItem { Label("Transcription", systemImage: "waveform") }
+                    .tag("transcription")
 
-            NotesTab()
-                .tabItem { Label("Notes & AI", systemImage: "sparkles") }
-                .tag("notes")
+                NotesTab()
+                    .tabItem { Label("Notes & AI", systemImage: "sparkles") }
+                    .tag("notes")
 
-            ShortcutsTab()
-                .tabItem { Label("Shortcuts", systemImage: "keyboard") }
-                .tag("shortcuts")
+                ShortcutsTab()
+                    .tabItem { Label("Shortcuts", systemImage: "keyboard") }
+                    .tag("shortcuts")
+            }
+            Divider()
+            Text(Self.versionString)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 6)
         }
-        .frame(width: 460, height: 320)
+        .frame(width: 460, height: 348)
+    }
+
+    /// "Scribe <version> · build <stamp> · <commit>" from the bundle's Info.plist
+    /// (build stamp + commit are injected by build.sh; blank in a plain dev run).
+    static var versionString: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let short = (info["CFBundleShortVersionString"] as? String) ?? "?"
+        let build = (info["CFBundleVersion"] as? String) ?? ""
+        let commit = (info["ScribeGitCommit"] as? String) ?? ""
+        var s = "Scribe \(short)"
+        if !build.isEmpty && build != short { s += " · build \(build)" }
+        if !commit.isEmpty { s += " · \(commit)" }
+        return s
     }
 }
 

@@ -1,14 +1,152 @@
 {% extends "base.html" %}
 {% block content %}
 
-  <a href="/notes" class="inline-flex items-center gap-1 font-mono text-xs text-ink-faint hover:text-accent transition-colors">← All notes</a>
+  <a href="{{ back_href }}" class="inline-flex items-center gap-1 font-mono text-xs text-ink-faint hover:text-accent transition-colors">← {{ back_label }}</a>
 
-  <header class="mt-3 mb-6">
-    <h1 class="font-display text-3xl sm:text-4xl font-semibold tracking-tight text-ink leading-tight">{{ title }}</h1>
-    <p class="mt-2 font-mono text-xs text-ink-faint">
-      {{ meta.date }}{% if meta.time %} · {{ meta.time }}{% endif %}{% if meta.type and meta.type != 'default' %} · {{ meta.type }}{% endif %}{% if meta.duration %} · {{ meta.duration }}{% endif %}
+  <div id="note-header" class="mt-3 mb-6">
+    {% include "_note_header.html" %}
+  </div>
+
+  {% if origin %}
+  <a href="/note?file={{ origin.filename | urlencode }}"
+     class="inline-flex items-center gap-1.5 mb-5 text-xs text-ink-soft hover:text-accent transition-colors">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18h6M10 21h4M8.5 14a5.5 5.5 0 1 1 7 0c-.7.55-1 1.2-1 2h-5c0-.8-.3-1.45-1-2Z"/></svg>
+    Developed from idea: <span class="font-medium">{{ origin.title }}</span>
+  </a>
+  {% endif %}
+
+  {% if developed %}
+  <div class="mb-5 rounded-xl border border-line bg-surface px-4 py-3">
+    <p class="font-mono text-[11px] uppercase tracking-[.1em] text-ink-faint mb-1">Developed into</p>
+    <ul class="divide-y divide-line">
+      {% for s in developed %}
+      <li>
+        <details class="group">
+          {# Title links to the full session; clicking elsewhere on the row expands a preview. #}
+          <summary class="flex items-center justify-between gap-3 py-1.5 cursor-pointer list-none [&::-webkit-details-marker]:hidden">
+            <span class="flex items-center gap-1.5 min-w-0">
+              <svg class="shrink-0 text-ink-faint group-open:rotate-90 transition-transform" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+              <a href="/note?file={{ s.filename | urlencode }}" onclick="event.stopPropagation()"
+                 class="text-sm text-ink hover:text-accent hover:underline truncate">{{ s.title }}</a>
+            </span>
+            <span class="font-mono text-xs text-ink-faint whitespace-nowrap">{{ s.date }}</span>
+          </summary>
+          <div class="md mt-1 pt-2 pb-2 pl-[18px] border-t border-line/60">{{ s.preview_html | safe }}</div>
+        </details>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% if is_idea and not archived %}
+  <section id="develop-panel" class="mb-7 bg-surface rounded-2xl border border-line p-5">
+    <h2 class="font-mono text-[11px] uppercase tracking-[.12em] text-accent mb-2">Develop this idea</h2>
+    <p class="text-xs text-ink-soft mb-3 leading-relaxed">
+      Ready to move on it? Record yourself talking through how you'd actually do this — it becomes a
+      working note with real to-dos in the Action Center, linked back to this idea.
     </p>
-  </header>
+    <input type="hidden" id="develop-filename" value="{{ filename }}">
+
+    <div data-dev="idle">
+      <button type="button" onclick="scribeDevStart()"
+              class="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-accent text-white text-sm font-semibold shadow-sm hover:bg-accent-hover transition-colors">
+        <span class="inline-block w-2 h-2 rounded-full bg-white"></span> Develop this idea
+      </button>
+    </div>
+
+    <div data-dev="recording" style="display:none" class="flex flex-wrap items-center gap-3">
+      <span class="inline-flex items-center gap-2 text-sm text-ink">
+        <span class="inline-block w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse"></span>
+        Recording <span data-dev-timer class="font-mono">00:00</span>
+      </span>
+      <span class="dev-eq inline-flex items-end gap-[2px] h-4 text-accent" title="Live input level" aria-hidden="true">
+        <i></i><i></i><i></i><i></i><i></i>
+      </span>
+      <button type="button" onclick="scribeDevStop()" class="btn-primary px-3 py-1.5 rounded-lg text-xs font-semibold">Stop &amp; process</button>
+      <button type="button" onclick="scribeDevCancel()" class="text-xs text-ink-faint hover:text-ink transition-colors">Cancel</button>
+    </div>
+
+    <div data-dev="processing" style="display:none" class="flex items-center gap-2 text-sm text-ink-soft">
+      <svg class="spin" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.2-8.5"/></svg>
+      Processing your idea — transcribing &amp; extracting to-dos…
+    </div>
+
+    <div data-dev="error" style="display:none" class="text-sm text-red-600 dark:text-red-400">
+      <span data-dev-err></span>
+      <button type="button" onclick="scribeDevReset()" class="ml-2 underline hover:no-underline">Try again</button>
+    </div>
+  </section>
+  <script>
+  (function(){
+    let rec, chunks = [], stream, timer, started, audioCtx, analyser, eqRaf;
+    function show(state){
+      document.querySelectorAll('#develop-panel [data-dev]').forEach(el => {
+        el.style.display = (el.getAttribute('data-dev') === state) ? '' : 'none';
+      });
+    }
+    function drawEq(){
+      const bars = document.querySelectorAll('#develop-panel .dev-eq i');
+      if (!analyser || !bars.length) return;
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(data);
+      const per = Math.max(1, Math.floor(data.length / bars.length));
+      bars.forEach((bar, i) => {
+        let sum = 0; for (let j = 0; j < per; j++) sum += data[i * per + j] || 0;
+        bar.style.height = Math.max(12, Math.min(100, (sum / per / 255) * 160)) + '%';
+      });
+      eqRaf = requestAnimationFrame(drawEq);
+    }
+    function stopStream(){
+      if (eqRaf){ cancelAnimationFrame(eqRaf); eqRaf = null; }
+      if (audioCtx){ try { audioCtx.close(); } catch(e){} audioCtx = null; }
+      analyser = null;
+      if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
+      if (timer){ clearInterval(timer); timer = null; }
+    }
+    window.scribeDevStart = async function(){
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+      catch(e){ return window.scribeDevErr('Microphone access was blocked. Allow mic access for localhost, then try again.'); }
+      chunks = []; rec = new MediaRecorder(stream);
+      rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+      rec.onstop = upload;
+      rec.start(); started = Date.now();
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 64; analyser.smoothingTimeConstant = 0.7;
+        audioCtx.createMediaStreamSource(stream).connect(analyser);
+        drawEq();
+      } catch (e) { /* visualizer is optional */ }
+      timer = setInterval(() => {
+        const s = Math.floor((Date.now() - started) / 1000);
+        const el = document.querySelector('#develop-panel [data-dev-timer]');
+        if (el) el.textContent = String(Math.floor(s/60)).padStart(2,'0') + ':' + String(s%60).padStart(2,'0');
+      }, 500);
+      show('recording');
+    };
+    window.scribeDevStop = function(){ if (timer){ clearInterval(timer); timer = null; } if (rec && rec.state !== 'inactive') rec.stop(); show('processing'); };
+    window.scribeDevCancel = function(){ if (rec && rec.state !== 'inactive'){ rec.onstop = null; rec.stop(); } stopStream(); chunks = []; show('idle'); };
+    window.scribeDevErr = function(msg){ const e = document.querySelector('#develop-panel [data-dev-err]'); if (e) e.textContent = msg; show('error'); };
+    window.scribeDevReset = function(){ show('idle'); };
+    async function upload(){
+      stopStream();
+      if (!chunks.length){ return window.scribeDevErr('No audio was captured.'); }
+      const type = (rec && rec.mimeType) || 'audio/webm';
+      const ext = type.indexOf('mp4') >= 0 ? 'mp4' : (type.indexOf('ogg') >= 0 ? 'ogg' : 'webm');
+      const fd = new FormData();
+      fd.append('filename', document.getElementById('develop-filename').value);
+      fd.append('audio', new Blob(chunks, { type }), 'develop.' + ext);
+      try {
+        const r = await fetch('/idea/develop', { method: 'POST', body: fd });
+        const data = await r.json();
+        if (data.ok && data.note) { window.location = '/note?file=' + encodeURIComponent(data.note); }
+        else { window.scribeDevErr(data.error || 'Processing failed.'); }
+      } catch(e){ window.scribeDevErr('Upload failed: ' + e.message); }
+    }
+  })();
+  </script>
+  {% endif %}
 
   {% if result %}
     {% if result.ok %}
@@ -50,37 +188,49 @@
   </details>
   {% endif %}
 
-  <section class="mb-7 bg-surface rounded-2xl border border-line p-5">
-    <h2 class="font-mono text-[11px] uppercase tracking-[.12em] text-accent mb-2">Request a correction</h2>
-    <p class="text-xs text-ink-soft mb-3 leading-relaxed">
-      Describe what's wrong in plain English. Scribe re-reads the original transcript with your
-      correction as the source of truth and regenerates the whole note — fixing names, owners, the
-      summary, and decisions everywhere they appear. Your checked-off items are kept.
-    </p>
-    <form method="post" action="/note/correct">
-      <input type="hidden" name="filename" value="{{ filename }}">
-      <textarea name="correction" rows="3" required
-                placeholder="e.g. I'm the host of this meeting, not Dwight. Dwight is the client I was meeting with — swap the attribution everywhere."
-                class="w-full rounded-lg border border-line px-3 py-2 text-sm bg-paper/40
-                       focus:outline-none focus:ring-2 focus:ring-accent/40 focus:border-accent/40"></textarea>
-      <div class="mt-2 flex items-center gap-3">
-        <button type="submit"
-                class="px-3.5 py-1.5 rounded-lg bg-accent text-white text-sm font-semibold
-                       shadow-sm hover:bg-accent-hover transition-colors">
-          Apply correction
+  <details class="group mb-7 bg-surface rounded-2xl border border-line overflow-hidden"{% if result or has_backup %} open{% endif %}>
+    <summary class="cursor-pointer select-none px-5 py-3.5 flex items-center gap-2 text-ink-soft hover:text-ink transition-colors list-none [&::-webkit-details-marker]:hidden">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>
+      </svg>
+      <span class="font-mono text-[11px] uppercase tracking-[.12em] text-accent">Request a correction</span>
+      <span class="ml-auto text-ink-faint transition-transform group-open:rotate-180">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+      </span>
+    </summary>
+    <div class="px-5 pb-5 pt-1 border-t border-line">
+      <p class="text-xs text-ink-soft mt-3 mb-3 leading-relaxed">
+        Describe what's wrong in plain English. Scribe re-reads the original transcript with your
+        correction as the source of truth and regenerates the whole note — fixing names, owners, the
+        summary, and decisions everywhere they appear. Your checked-off items are kept.
+      </p>
+      <form method="post" action="/note/correct">
+        <input type="hidden" name="filename" value="{{ filename }}">
+        <input type="hidden" name="from" value="{{ origin_from }}">
+        <textarea name="correction" rows="3" required
+                  placeholder="e.g. I'm the host of this meeting, not Dwight. Dwight is the client I was meeting with — swap the attribution everywhere."
+                  class="w-full rounded-lg border border-line px-3 py-2 text-sm bg-paper/40
+                         focus:outline-none focus:ring-2 focus:ring-accent/40 focus:border-accent/40"></textarea>
+        <div class="mt-2 flex items-center gap-3">
+          <button type="submit"
+                  class="px-3.5 py-1.5 rounded-lg bg-accent text-white text-sm font-semibold
+                         shadow-sm hover:bg-accent-hover transition-colors">
+            Apply correction
+          </button>
+          <span class="font-mono text-[11px] text-ink-faint">Re-runs the LLM — may take a few seconds.</span>
+        </div>
+      </form>
+      {% if has_backup %}
+      <form method="post" action="/note/undo" class="mt-3 pt-3 border-t border-line">
+        <input type="hidden" name="filename" value="{{ filename }}">
+        <input type="hidden" name="from" value="{{ origin_from }}">
+        <button type="submit" class="font-mono text-[11px] text-ink-faint hover:text-ink transition-colors">
+          ↩ Undo last correction
         </button>
-        <span class="font-mono text-[11px] text-ink-faint">Re-runs the LLM — may take a few seconds.</span>
-      </div>
-    </form>
-    {% if has_backup %}
-    <form method="post" action="/note/undo" class="mt-3 pt-3 border-t border-line">
-      <input type="hidden" name="filename" value="{{ filename }}">
-      <button type="submit" class="font-mono text-[11px] text-ink-faint hover:text-ink transition-colors">
-        ↩ Undo last correction
-      </button>
-    </form>
-    {% endif %}
-  </section>
+      </form>
+      {% endif %}
+    </div>
+  </details>
 
   <article class="md bg-surface rounded-2xl border border-line p-6">
     {{ body_html | safe }}
@@ -92,5 +242,22 @@
     <pre class="mt-2 whitespace-pre-wrap break-words text-xs leading-relaxed text-ink-soft bg-surface rounded-xl border border-line p-4 font-mono">{{ transcript }}</pre>
   </details>
   {% endif %}
+
+  <div class="mt-8 pt-4 border-t border-line flex items-center gap-5">
+    {% if is_idea %}
+    <form method="post" action="/note/archive">
+      <input type="hidden" name="filename" value="{{ filename }}">
+      <input type="hidden" name="archived" value="{{ 'false' if archived else 'true' }}">
+      <button type="submit" class="font-mono text-[11px] text-ink-faint hover:text-accent transition-colors">
+        {{ 'Restore to Someday' if archived else 'Archive idea' }}
+      </button>
+    </form>
+    {% endif %}
+    <form method="post" action="/note/delete"
+          data-confirm="Move this note to trash? It’s removed from Scribe but recoverable from the notes/.trash folder. The transcript and audio are kept.">
+      <input type="hidden" name="filename" value="{{ filename }}">
+      <button type="submit" class="font-mono text-[11px] text-ink-faint hover:text-red-600 transition-colors">Delete note</button>
+    </form>
+  </div>
 
 {% endblock %}

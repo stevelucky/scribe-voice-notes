@@ -1,6 +1,6 @@
-<li class="item-row flex items-start gap-3 px-4 py-3 hover:bg-paper/60 transition-colors
-           {% if item and item.done %}opacity-50{% endif %}"
-    {% if item %}data-bucket="{{ item.bucket }}"{% endif %}>
+<li class="item-row group flex items-start gap-3 px-4 py-3 hover:bg-paper/60 transition-colors
+           {% if item and item.done and bucket == 'done' %}opacity-50{% endif %}"
+    {% if item %}data-bucket="{{ item.bucket }}" data-key="{{ item.note_filename }}|{{ item.line_no }}"{% endif %}>
   {% if item %}
   <input type="checkbox" autocomplete="off" {% if item.done %}checked{% endif %}
          class="mt-0.5 h-4 w-4 rounded border-line text-accent cursor-pointer
@@ -16,6 +16,17 @@
 
   <div class="flex-1 min-w-0">
     <span class="text-sm leading-snug {% if item.done %}line-through text-ink-faint{% else %}text-ink{% endif %}">{{ item.text }}</span>
+    {% if item.done and bucket != 'done' %}
+    <div class="mt-1 inline-flex items-center gap-1 text-[11px] text-accent">
+      <svg class="spin" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.2-8.5"/></svg>
+      Moving to Done — uncheck to keep
+    </div>
+    {% elif not item.done and bucket == 'done' %}
+    <div class="mt-1 inline-flex items-center gap-1 text-[11px] text-accent">
+      <svg class="spin" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.2-8.5"/></svg>
+      Moving back to to-dos — re-check to keep done
+    </div>
+    {% endif %}
     {% set show_owner = item.owner and item.bucket == 'waiting' %}
     {% if show_owner or item.deadline %}
     <div class="mt-1.5 flex flex-wrap gap-2 text-xs">
@@ -68,7 +79,7 @@
       <div class="mt-1.5 pl-2.5 border-l-2 border-accent-tint text-xs text-ink-soft space-y-1">
         <div>{{ item.text }} <span class="text-ink-faint">· {{ item.note_title }} (this)</span></div>
         {% for s in item.sources %}
-        <div>{{ s.text }} <span class="text-ink-faint">· <a class="hover:text-accent hover:underline" href="/note?file={{ s.note_filename | urlencode }}">{{ s.note_title }}</a></span></div>
+        <div>{{ s.text }} <span class="text-ink-faint">· <a class="hover:text-accent hover:underline" href="/note?file={{ s.note_filename | urlencode }}&from=actions">{{ s.note_title }}</a></span></div>
         {% endfor %}
         <button type="button" class="mt-1 text-[11px] text-ink-faint hover:text-red-600 transition-colors"
                 hx-post="/action-items/unmerge" hx-include="closest .item-row"
@@ -108,5 +119,15 @@
     {% endfor %}
     <option value="unassigned" {% if item.bucket == 'unassigned' %}selected{% endif %}>Unassigned</option>
   </select>
+
+  <button type="button" title="Delete to-do" aria-label="Delete to-do"
+          class="shrink-0 mt-0.5 p-1 rounded text-ink-faint hover:text-red-600 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+          hx-post="/action-items/delete" hx-include="closest .item-row"
+          hx-target="#item-list" hx-swap="innerHTML"
+          hx-confirm="Delete this to-do? It will be removed from the note.">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1L5 6M10 11v6M14 11v6"/>
+    </svg>
+  </button>
   {% endif %}
 </li>

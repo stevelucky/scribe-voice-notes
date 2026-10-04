@@ -2,8 +2,12 @@ recording:
   sample_rate: 16000
   channels: 1
   format: wav
-  max_duration_minutes: 120
+  max_duration_minutes: 360
   recordings_dir: recordings
+  # After this many seconds of continuous silence, pause writing until sound
+  # returns (keeps a meeting left running over a break from bloating). 0 = off.
+  auto_pause_silence_seconds: 90
+  auto_pause_level: 0.01
 
 transcription:
   # Active engine: whisper | indicwhisper | parakeet

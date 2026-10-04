@@ -1,11 +1,12 @@
 {% if notes %}
 <div class="space-y-2">
   {% for n in notes %}
-  <a href="/note?file={{ n.filename | urlencode }}"
+  <a href="/note?file={{ n.filename | urlencode }}&from=notes"
      class="lift block bg-surface rounded-xl border border-line px-4 py-3.5 flex items-baseline justify-between gap-3 hover:border-accent/30">
     <span class="font-medium text-ink truncate">{{ n.title }}</span>
     <span class="shrink-0 flex items-baseline gap-2 whitespace-nowrap">
-      {% if n.type and n.type != 'default' %}<span class="text-[11px] px-2 py-0.5 rounded-full bg-line/70 text-ink-soft">{{ n.type }}</span>{% endif %}
+      {% set tag = n.category or ((n.type | replace('_', ' ') | title) if (n.type and n.type != 'default') else '') %}
+      {% if tag %}<span class="text-[11px] px-2 py-0.5 rounded-full bg-line/70 text-ink-soft">{{ tag }}</span>{% endif %}
       <span class="font-mono text-xs text-ink-faint">{{ n.date }}</span>
     </span>
   </a>

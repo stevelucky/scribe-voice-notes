@@ -4,21 +4,34 @@ import KeyboardShortcuts
 struct MenuBarView: View {
     @EnvironmentObject var recorder: RecordingManager
 
+    private var showTranscribeBar: Bool {
+        recorder.stepState(for: "transcribing") == .active && recorder.transcribeProgress >= 0
+    }
+    private var transcribeBarValue: Double {
+        min(max(recorder.transcribeProgress, 0), 1)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             if recorder.isRecording {
                 HStack {
                     Circle()
-                        .fill(.red)
+                        .fill(recorder.isPaused ? Color.gray : .red)
                         .frame(width: 8, height: 8)
                     // Live elapsed time is shown in the menu-bar icon itself; keeping
                     // it out of the dropdown means this menu never re-renders while
                     // open, so hover highlighting stays stable.
-                    Text("Recording")
+                    Text(recorder.isPaused
+                         ? recorder.pauseStatusText
+                         : (recorder.captureMode == .idea ? "Recording idea" : "Recording"))
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
                 .allowsHitTesting(false)
+
+                Button(recorder.isPaused ? "Resume Recording" : "Pause Recording") {
+                    recorder.togglePause()
+                }
 
                 Button("Stop Recording") {
                     Task { await recorder.stopRecording() }
@@ -50,16 +63,28 @@ struct MenuBarView: View {
 
                     ProcessingStepView(
                         label: "Transcribing audio",
-                        state: recorder.stepState(for: "transcribing")
+                        state: recorder.stepState(for: "transcribing"),
+                        trailing: recorder.stepState(for: "transcribing") == .active ? recorder.stageElapsedText : ""
                     )
                     ProcessingStepView(
                         label: "Extracting notes (\(recorder.llmProvider))",
-                        state: recorder.stepState(for: "processing")
+                        state: recorder.stepState(for: "processing"),
+                        trailing: recorder.stepState(for: "processing") == .active ? recorder.stageElapsedText : ""
                     )
                     ProcessingStepView(
                         label: "Saving & exporting",
-                        state: recorder.stepState(for: "saving")
+                        state: recorder.stepState(for: "saving"),
+                        trailing: recorder.stepState(for: "saving") == .active ? recorder.stageElapsedText : ""
                     )
+
+                    // One real progress bar (transcription only — the sole step with
+                    // determinate progress). Reserve its height even when hidden so
+                    // menu items below don't shift as it appears/disappears.
+                    ProgressView(value: transcribeBarValue)
+                        .progressViewStyle(.linear)
+                        .controlSize(.small)
+                        .opacity(showTranscribeBar ? 1 : 0)
+                        .frame(height: 4)
 
                     // Always render this row (even when empty) at a fixed height.
                     // If it toggled in/out, every menu item below it would shift by
@@ -91,10 +116,16 @@ struct MenuBarView: View {
                 .allowsHitTesting(false)
 
             } else {
-                Button("Start Recording") {
+                Button("Record Meeting") {
                     Task { await recorder.startRecording() }
                 }
                 .globalKeyboardShortcut(.toggleRecording)
+
+                // Capture a long-term idea: same recording flow, but processed
+                // idea-shaped (no to-do hunting). Surfaces under the Someday tab.
+                Button("Record Idea") {
+                    Task { await recorder.startRecording(mode: .idea) }
+                }
 
                 Button("Process Audio File...") {
                     recorder.pickAndProcessAudioFile()
@@ -183,19 +214,44 @@ enum StepState {
 struct ProcessingStepView: View {
     let label: String
     let state: StepState
+    var trailing: String = ""   // e.g. an elapsed timer on the active step
 
     var body: some View {
-        stateIcon + Text("  \(label)").font(.caption)
+        HStack(spacing: 6) {
+            icon
+                .frame(width: 13, height: 13)   // fixed, so labels stay aligned
+            Text(label)
+                .font(.caption)
+                .fontWeight(state == .active ? .semibold : .regular)
+                .foregroundStyle(labelColor)
+            if !trailing.isEmpty {
+                Text("· \(trailing)")
+                    .font(.caption)
+                    .foregroundStyle(state == .active ? .secondary : .tertiary)
+            }
+            Spacer(minLength: 0)
+        }
     }
 
-    private var stateIcon: Text {
+    @ViewBuilder private var icon: some View {
         switch state {
         case .pending:
-            return Text("○").font(.caption).foregroundStyle(.quaternary)
+            Text("○").font(.caption).foregroundStyle(.quaternary)
         case .active:
-            return Text("◉").font(.caption).foregroundStyle(.blue)
+            // A live spinner is the clearest "this is actually running" signal.
+            ProgressView()
+                .controlSize(.small)
+                .scaleEffect(0.65)
         case .done:
-            return Text("✓").font(.caption).foregroundStyle(.green)
+            Text("✓").font(.caption).foregroundStyle(.green)
+        }
+    }
+
+    private var labelColor: Color {
+        switch state {
+        case .active:  return .primary          // black/high-contrast: the live step
+        case .done:    return .secondary
+        case .pending: return Color.secondary.opacity(0.55)
         }
     }
 }
