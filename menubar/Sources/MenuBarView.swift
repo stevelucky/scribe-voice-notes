@@ -216,42 +216,37 @@ struct ProcessingStepView: View {
     let state: StepState
     var trailing: String = ""   // e.g. an elapsed timer on the active step
 
+    // MUST stay a single concatenated Text so it renders as one clean menu row.
+    // MenuBarExtra's default .menu style turns content into NSMenuItems, and
+    // rich layout (HStack / Spacer / ProgressView) gets flattened into separate,
+    // badly-spaced lines — so emphasis is done with Text styling, not a spinner.
     var body: some View {
-        HStack(spacing: 6) {
-            icon
-                .frame(width: 13, height: 13)   // fixed, so labels stay aligned
-            Text(label)
-                .font(.caption)
-                .fontWeight(state == .active ? .semibold : .regular)
-                .foregroundStyle(labelColor)
-            if !trailing.isEmpty {
-                Text("· \(trailing)")
-                    .font(.caption)
-                    .foregroundStyle(state == .active ? .secondary : .tertiary)
-            }
-            Spacer(minLength: 0)
-        }
+        (stateIcon
+         + Text("  \(label)")
+            .fontWeight(state == .active ? .bold : .regular)
+            .foregroundColor(labelColor)
+         + (trailing.isEmpty
+            ? Text("")
+            : Text("  ·  \(trailing)").foregroundColor(.secondary))
+        ).font(.caption)
     }
 
-    @ViewBuilder private var icon: some View {
+    private var stateIcon: Text {
         switch state {
         case .pending:
-            Text("○").font(.caption).foregroundStyle(.quaternary)
+            return Text("○").foregroundColor(Color.secondary.opacity(0.5))
         case .active:
-            // A live spinner is the clearest "this is actually running" signal.
-            ProgressView()
-                .controlSize(.small)
-                .scaleEffect(0.65)
+            return Text("◉").foregroundColor(.accentColor)
         case .done:
-            Text("✓").font(.caption).foregroundStyle(.green)
+            return Text("✓").foregroundColor(.green)
         }
     }
 
     private var labelColor: Color {
         switch state {
-        case .active:  return .primary          // black/high-contrast: the live step
+        case .active:  return .primary          // high-contrast: the live step
         case .done:    return .secondary
-        case .pending: return Color.secondary.opacity(0.55)
+        case .pending: return Color.secondary.opacity(0.6)
         }
     }
 }
