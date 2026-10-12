@@ -32,6 +32,67 @@ def _resolve_length(length, segments=None):
 
 
 
+def _resolve_auto_type(meeting_type, transcript_text):
+    """Resolve the special '--type auto' into a concrete type by classifying the
+    transcript as an idea session or a general meeting. Any other value (including
+    None) passes through unchanged so explicit choices are always honored."""
+    if meeting_type != "auto":
+        return meeting_type
+    from .processor import classify_recording
+    return "idea" if classify_recording(transcript_text) == "idea" else "default"
+
+
+def _fmt_secs(secs) -> str:
+    secs = int(max(0, secs))
+    m, s = divmod(secs, 60)
+    if m >= 60:
+        h, m = divmod(m, 60)
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _make_transcribe_progress(stage_fn):
+    """A throttled 0–1 progress callback that emits `transcribing` stage markers
+    with a percentage and a rough ETA (extrapolated from elapsed time). The menu
+    bar reads these to fill a real progress bar."""
+    state = {"t0": time.time(), "last": 0.0}
+
+    def cb(frac):
+        now = time.time()
+        if frac < 0.999 and now - state["last"] < 0.8:  # throttle chatter
+            return
+        state["last"] = now
+        frac = max(0.0, min(1.0, frac))
+        pct = int(frac * 100)
+        elapsed = now - state["t0"]
+        if frac > 0.03:
+            detail = f"{pct}% · ~{_fmt_secs(elapsed / frac - elapsed)} left"
+        else:
+            detail = f"{pct}% · estimating…"
+        stage_fn("transcribing", detail, pct=pct)
+
+    return cb
+
+
+def _apply_diarization(transcript, audio_path):
+    """Diarize + identify speakers and merge into the transcript. Non-fatal: on any
+    failure (e.g. a GPU out-of-memory on a very long meeting) it warns and returns
+    the transcript unchanged — so the note is still produced, just without speaker
+    labels, rather than losing the whole recording."""
+    try:
+        from .diarizer import Diarizer, identify_and_merge
+        from .config import _BASE_DIR
+        d = Diarizer()
+        speaker_segments = d.diarize(audio_path)
+        return identify_and_merge(transcript, speaker_segments, audio_path, _BASE_DIR)
+    except Exception as e:
+        print(f"[diarizer] Skipping diarization ({type(e).__name__}: {e}) — the note "
+              f"will have no speaker labels.", file=sys.stderr)
+        return transcript
+
+
 _SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
@@ -206,6 +267,7 @@ def record(duration, output, meter):
     from .recorder import Recorder
 
     on_level = None
+    on_state = None
     if meter:
         def on_level(bands):
             # One compact JSON object per line on stdout; the menu bar parses these
@@ -216,7 +278,16 @@ def record(duration, output, meter):
             except (BrokenPipeError, ValueError, OSError):
                 pass
 
-    rec = Recorder(output_path=output, on_level=on_level)
+        def on_state(paused, reason):
+            # Pause-state transitions (silence auto-pause / manual pause); the menu
+            # bar reads these to reflect a paused recording.
+            try:
+                sys.stdout.write(_json.dumps({"paused": bool(paused), "reason": reason}) + "\n")
+                sys.stdout.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                pass
+
+    rec = Recorder(output_path=output, on_level=on_level, on_state=on_state)
     rec.start()
     click.echo(click.style("Recording... ", fg="red", bold=True) + "Press Ctrl+C to stop.")
 
@@ -228,6 +299,12 @@ def record(duration, output, meter):
         stopped.set()
 
     old_handler = signal.signal(signal.SIGINT, handle_stop)
+    # SIGUSR1 toggles a deliberate pause (sent by the menu bar's Pause/Resume).
+    old_usr1 = None
+    try:
+        old_usr1 = signal.signal(signal.SIGUSR1, lambda s, f: rec.toggle_manual_pause())
+    except (ValueError, OSError, AttributeError):
+        pass
 
     try:
         while not stopped.is_set():
@@ -236,10 +313,23 @@ def record(duration, output, meter):
             click.echo(f"\r  {m:02d}:{s:02d}", nl=False, err=True)
             if cap and elapsed >= cap:
                 click.echo(f"\n[recorder] Reached max duration ({cap}s) — stopping.", err=True)
+                if meter:
+                    # Tell the menu bar the recording hit its cap, so it can notify
+                    # the user and process the file instead of appearing to record on.
+                    try:
+                        sys.stdout.write(_json.dumps({"capped": True, "limit_min": cap // 60}) + "\n")
+                        sys.stdout.flush()
+                    except (BrokenPipeError, ValueError, OSError):
+                        pass
                 break
             stopped.wait(0.5)
     finally:
         signal.signal(signal.SIGINT, old_handler)
+        if old_usr1 is not None:
+            try:
+                signal.signal(signal.SIGUSR1, old_usr1)
+            except (ValueError, OSError):
+                pass
 
     click.echo(err=True)
     filepath = rec.stop()
@@ -269,9 +359,12 @@ def transcribe(audio_path, engine):
 @click.option("--engine", "-e", type=click.Choice(["whisper", "indicwhisper", "parakeet"]), default=None,
               help="Transcription engine (default: from config)")
 @click.option("--type", "-t", "meeting_type", default=None,
-              help="Meeting type: default, standup, strategy, one_on_one, brainstorm, interview")
+              help="Meeting type: default, idea, standup, strategy, one_on_one, brainstorm, interview. "
+                   "Use 'auto' to detect meeting vs idea from the audio.")
 @click.option("--diarize/--no-diarize", default=None, help="Enable speaker diarization")
-def process(audio_path, context, slack, engine, meeting_type, diarize):
+@click.option("--from-idea", "from_idea", default=None,
+              help="Link this note back to a Someday idea (its note filename).")
+def process(audio_path, context, slack, engine, meeting_type, diarize, from_idea):
     """Transcribe and process an audio file into structured notes."""
     import json as _json
     import sys as _sys
@@ -299,20 +392,22 @@ def process(audio_path, context, slack, engine, meeting_type, diarize):
     t = Transcriber(engine=engine)
     stage("transcribing", f"{dur_str} audio")
     with live_timer(f"Transcribing ({engine_name}, {dur_str} audio)"):
-        transcript = t.transcribe(audio_path)
+        transcript = t.transcribe(audio_path, progress=_make_transcribe_progress(stage))
 
     with live_timer("Cleaning transcript"):
         transcript = clean_transcript(transcript)
 
     do_diarize = diarize if diarize is not None else CONFIG.get("transcription", {}).get("diarization", {}).get("enabled", False)
     if do_diarize:
-        from .diarizer import Diarizer, identify_and_merge
-        from .config import _BASE_DIR
         stage("diarizing", "Running pyannote pipeline...")
         with live_timer("Diarizing speakers"):
-            d = Diarizer()
-            speaker_segments = d.diarize(audio_path)
-            transcript = identify_and_merge(transcript, speaker_segments, audio_path, _BASE_DIR)
+            transcript = _apply_diarization(transcript, audio_path)
+
+    if meeting_type == "auto":
+        stage("classifying", "Detecting meeting vs idea")
+        with live_timer("Detecting recording type"):
+            meeting_type = _resolve_auto_type(meeting_type, transcript["text"])
+        click.echo(f"  [auto-type → {meeting_type}]", err=True)
 
     p = Processor(meeting_type=meeting_type)
     stage("processing")
@@ -321,7 +416,7 @@ def process(audio_path, context, slack, engine, meeting_type, diarize):
 
     stage("saving")
     with live_timer("Saving note + compressing audio"):
-        note_path = write_note(processed, transcript, audio_path, audio_dur)
+        note_path = write_note(processed, transcript, audio_path, audio_dur, from_idea=from_idea)
         _compress_audio(audio_path)
         _prune_old_audio()
 
@@ -355,7 +450,7 @@ def process(audio_path, context, slack, engine, meeting_type, diarize):
 @click.option("--engine", "-e", type=click.Choice(["whisper", "indicwhisper", "parakeet"]), default=None,
               help="Transcription engine (default: from config)")
 @click.option("--type", "-t", "meeting_type", default=None,
-              help="Meeting type: default, standup, strategy, one_on_one, brainstorm, interview")
+              help="Meeting type: default, idea, standup, strategy, one_on_one, brainstorm, interview")
 @click.option("--length", type=click.Choice(["short","medium","long","open"]), default=None, help="Meeting length. Long enables 30-min chunked summarization.")
 @click.option("--diarize/--no-diarize", default=None, help="Enable speaker diarization")
 def quick(context, slack, duration, engine, meeting_type, length, diarize):
@@ -416,12 +511,8 @@ def quick(context, slack, duration, engine, meeting_type, length, diarize):
 
     do_diarize = diarize if diarize is not None else CONFIG.get("transcription", {}).get("diarization", {}).get("enabled", False)
     if do_diarize:
-        from .diarizer import Diarizer, identify_and_merge
-        from .config import _BASE_DIR
         with live_timer("Diarizing speakers"):
-            d = Diarizer()
-            speaker_segments = d.diarize(audio_path)
-            transcript = identify_and_merge(transcript, speaker_segments, audio_path, _BASE_DIR)
+            transcript = _apply_diarization(transcript, audio_path)
 
     p = Processor(meeting_type=meeting_type)
     _strategy = _resolve_length(length, transcript.get("segments"))
@@ -481,7 +572,7 @@ def types():
 @cli.command()
 @click.argument("transcript_path", type=click.Path(exists=True))
 @click.option("--type", "-t", "meeting_type", required=True,
-              help="Meeting type: default, standup, strategy, one_on_one, brainstorm, interview")
+              help="Meeting type: default, idea, standup, strategy, one_on_one, brainstorm, interview")
 @click.option("--context", "-c", default="", help="Additional context for the LLM")
 def reprocess(transcript_path, meeting_type, context):
     """Re-summarize a saved transcript with a different meeting type.
@@ -534,7 +625,9 @@ def menubar():
 @cli.command("process-latest")
 @click.option("--engine", "-e", type=click.Choice(["whisper", "indicwhisper", "parakeet"]), default=None)
 @click.option("--diarize/--no-diarize", default=None, help="Enable speaker diarization")
-def process_latest(engine, diarize):
+@click.option("--type", "-t", "meeting_type", default=None,
+              help="Meeting type (default: from config). Use 'idea' for an idea session.")
+def process_latest(engine, diarize, meeting_type):
     """Process the most recent recording. Used by the menu bar app."""
     import json as _json
     from .transcriber import Transcriber
@@ -573,24 +666,24 @@ def process_latest(engine, diarize):
 
     t0 = time.time()
     t = Transcriber(engine=engine)
-    transcript = t.transcribe(audio_path)
+    transcript = t.transcribe(audio_path, progress=_make_transcribe_progress(stage))
     
     transcript = clean_transcript(transcript)
     
     do_diarize = diarize if diarize is not None else CONFIG.get("transcription", {}).get("diarization", {}).get("enabled", False)
     if do_diarize:
         stage("diarizing", "Running pyannote pipeline...")
-        from .diarizer import Diarizer, identify_and_merge
-        from .config import _BASE_DIR
-        d = Diarizer()
-        speaker_segments = d.diarize(audio_path)
-        transcript = identify_and_merge(transcript, speaker_segments, audio_path, _BASE_DIR)
+        transcript = _apply_diarization(transcript, audio_path)
         
     t1 = time.time()
 
+    if meeting_type == "auto":
+        stage("classifying", "Detecting meeting vs idea")
+        meeting_type = _resolve_auto_type(meeting_type, transcript["text"])
+
     stage("processing", f"Transcribed in {t1 - t0:.1f}s — sending to LLM")
 
-    p = Processor()
+    p = Processor(meeting_type=meeting_type)
     processed = p.process(transcript["text"])
     t2 = time.time()
 
@@ -727,6 +820,43 @@ def cleanup_audio():
         return
     n = _prune_old_audio()
     click.echo(click.style(f"Deleted {n} audio file(s) older than {days} days.", fg="yellow"), err=True)
+
+
+@cli.command("retag")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt")
+@click.option("--all", "force_all", is_flag=True,
+              help="Re-tag even notes that already have a category")
+def retag(yes, force_all):
+    """Infer a category (Phone call, Meeting, Voice note, …) for existing notes.
+
+    Non-destructive: only adds/updates the `category` frontmatter line — your
+    checked-off items, merges, reassignments, and notes are untouched. Targets
+    general (type: default) notes that lack a category; idea/standup/etc. keep
+    their own label.
+    """
+    from . import notes_index as ni
+    from .corrections import _load_transcript
+    from .processor import classify_category
+
+    notes = ni.load_notes()
+    targets = [n for n in notes
+               if (n.type or "default") in ("", "default") and (force_all or not n.category)]
+    if not targets:
+        click.echo("Nothing to tag — all general notes already have a category.", err=True)
+        return
+    if not yes:
+        click.confirm(f"Classify and tag {len(targets)} note(s)? (one quick LLM call each)", abort=True)
+
+    done = 0
+    for n in targets:
+        base = n.filename[:-3] if n.filename.endswith(".md") else n.filename
+        tr = _load_transcript(base)
+        text = (tr.get("text") if tr else "") or n.body
+        cat = classify_category(text)
+        if cat and ni.set_category(n.filename, cat):
+            done += 1
+            click.echo(f"  {cat:<12} ← {n.title[:54]}", err=True)
+    click.echo(click.style(f"\nTagged {done} of {len(targets)} note(s).", fg="green"), err=True)
 
 
 @cli.command("reprocess-all")

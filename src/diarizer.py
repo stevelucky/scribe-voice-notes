@@ -10,7 +10,12 @@ class Diarizer:
                 "HF_TOKEN environment variable not set. "
                 "Please get a token from Hugging Face and accept the pyannote/speaker-diarization-3.1 terms."
             )
-        
+
+        # Let MPS use the machine's full memory instead of the default ~70%
+        # watermark, so a long meeting doesn't hit an artificial GPU cap. Must be
+        # set before torch initializes the backend; a user override is respected.
+        os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+
         try:
             from pyannote.audio import Pipeline
             import torch
@@ -19,30 +24,57 @@ class Diarizer:
                 "pyannote.audio is not installed. "
                 "Please install it with: pip install pyannote.audio torch torchaudio"
             )
-            
+        self._torch = torch
+
         print("[diarizer] Loading pyannote pipeline...", file=sys.stderr)
         self.pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             token=token
         )
-        
-        # Apple Silicon support if available, otherwise CPU
+
+        # Prefer the GPU (Apple Silicon MPS / CUDA), else CPU.
+        self._device = "cpu"
         if torch.backends.mps.is_available():
-            self.pipeline.to(torch.device("mps"))
+            self._device = "mps"
         elif torch.cuda.is_available():
-            self.pipeline.to(torch.device("cuda"))
+            self._device = "cuda"
+        self.pipeline.to(torch.device(self._device))
+
+    def _empty_cache(self):
+        try:
+            if self._torch.backends.mps.is_available():
+                self._torch.mps.empty_cache()
+            elif self._torch.cuda.is_available():
+                self._torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def diarize(self, audio_path: str) -> list:
-        """Run diarization and return a list of segments."""
-        print(f"[diarizer] Diarizing: {audio_path}", file=sys.stderr)
-        out = self.pipeline(audio_path)
-        
+        """Run diarization and return a list of segments.
+
+        On a GPU out-of-memory (long meetings can exceed the Metal/CUDA budget)
+        it retries once on CPU — slower, but bounded by system RAM rather than the
+        GPU's cap.
+        """
+        print(f"[diarizer] Diarizing on {self._device}: {audio_path}", file=sys.stderr)
+        try:
+            out = self.pipeline(audio_path)
+        except (RuntimeError, MemoryError) as e:
+            if self._device == "cpu" or "out of memory" not in str(e).lower():
+                raise
+            print(f"[diarizer] {self._device.upper()} ran out of memory on this file — "
+                  f"retrying on CPU (slower).", file=sys.stderr)
+            self._empty_cache()
+            self._device = "cpu"
+            self.pipeline.to(self._torch.device("cpu"))
+            out = self.pipeline(audio_path)
+
         # pyannote.audio 3.1+ may return a DiarizeOutput object
         if hasattr(out, "itertracks"):
             annotation = out
         else:
             annotation = out.speaker_diarization
-        
+
         segments = []
         for turn, _, speaker in annotation.itertracks(yield_label=True):
             segments.append({
@@ -50,7 +82,7 @@ class Diarizer:
                 "end": turn.end,
                 "speaker": speaker
             })
-            
+
         return segments
 
 

@@ -6,8 +6,10 @@ source `.md`). Used by the web front end; the MCP server can be consolidated ont
 it later.
 """
 
+import json
 import os
 import re
+import shutil
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timedelta
 
@@ -26,28 +28,38 @@ _DEADLINE_RE = re.compile(r"\s*\(by (?P<deadline>[^)]+)\)\s*$")
 _TRAILING_COMMENT_RE = re.compile(r"\s*<!--\s*(?P<body>(?:(?!-->).)*?)\s*-->\s*$")
 _NOTE_BODY_RE = re.compile(r"^note:\s*(?P<note>.*)$", re.I | re.S)
 _MERGE_BODY_RE = re.compile(r"^merge:\s*(?P<gid>\S+)(?P<primary>\s+primary)?\s*$", re.I)
+# Someday tag: a flagged item awaiting triage ("review", with a suggested kind)
+# or a confirmed long-term idea ("parked"). Keeps these out of the Action Center.
+_SOMEDAY_BODY_RE = re.compile(
+    r"^someday:\s*(?P<state>review|parked)(?:\s+(?P<kind>idea|todo))?\s*$", re.I)
 
 
 def _parse_item(inner: str) -> dict:
     """Parse the text inside a checkbox into its parts.
 
-    Returns {task, owner, deadline, note, merge_id, merge_primary}. Peels trailing
-    HTML comments (note / merge, any order) first, then the deadline suffix, then
-    the leading owner."""
+    Returns {task, owner, deadline, note, merge_id, merge_primary, someday_state,
+    someday_kind}. Peels trailing HTML comments (note / merge / someday, any order)
+    first, then the deadline suffix, then the leading owner."""
     text = inner.strip()
     note = None
     merge_id = ""
     merge_primary = False
+    someday_state = ""
+    someday_kind = ""
     while True:
         m = _TRAILING_COMMENT_RE.search(text)
         if not m:
             break
         body = m.group("body")
         mm = _MERGE_BODY_RE.match(body)
+        sm = _SOMEDAY_BODY_RE.match(body)
         nm = _NOTE_BODY_RE.match(body)
         if mm:
             merge_id = mm.group("gid")
             merge_primary = bool(mm.group("primary"))
+        elif sm:
+            someday_state = sm.group("state").lower()
+            someday_kind = (sm.group("kind") or "").lower()
         elif nm:
             note = nm.group("note").strip() or None
         else:
@@ -67,12 +79,14 @@ def _parse_item(inner: str) -> dict:
         text = m.group("rest").strip()
 
     return {"task": text, "owner": owner, "deadline": deadline,
-            "note": note, "merge_id": merge_id, "merge_primary": merge_primary}
+            "note": note, "merge_id": merge_id, "merge_primary": merge_primary,
+            "someday_state": someday_state, "someday_kind": someday_kind}
 
 
 def _compose_item(task: str, owner: "str | None", deadline: "str | None",
                   note: "str | None" = None, merge_id: str = "",
-                  merge_primary: bool = False) -> str:
+                  merge_primary: bool = False, someday_state: str = "",
+                  someday_kind: str = "") -> str:
     """Rebuild a checkbox's inner text from its parts (inverse of _parse_item)."""
     inner = f"**{owner}**: {task}" if owner else task
     if deadline:
@@ -82,6 +96,10 @@ def _compose_item(task: str, owner: "str | None", deadline: "str | None",
         inner += f" <!-- note: {clean_note} -->"
     if merge_id:
         inner += f" <!-- merge: {merge_id}{' primary' if merge_primary else ''} -->"
+    if someday_state:
+        # kind is only meaningful while a flagged item is awaiting review.
+        kind = f" {someday_kind}" if (someday_state == "review" and someday_kind) else ""
+        inner += f" <!-- someday: {someday_state}{kind} -->"
     return inner
 
 
@@ -114,7 +132,20 @@ def _build_me_matcher():
     return re.compile(rf"\b(?:{pattern})\b", re.IGNORECASE)
 
 
-_ME_MATCHER = _build_me_matcher()
+# The compiled matcher is cached but keyed on the current identity, so if the
+# user edits their name/aliases live (Settings → Identity, which rewrites
+# config.yaml) the next lookup rebuilds it instead of serving a stale match.
+_ME_MATCHER_KEY = None
+_ME_MATCHER = None
+
+
+def _me_matcher():
+    global _ME_MATCHER_KEY, _ME_MATCHER
+    key = tuple(user_identity())
+    if key != _ME_MATCHER_KEY:
+        _ME_MATCHER = _build_me_matcher()
+        _ME_MATCHER_KEY = key
+    return _ME_MATCHER
 
 
 _SPEAKER_LABEL_RE = re.compile(r"^speaker[_ ]?\d+$", re.IGNORECASE)
@@ -126,7 +157,8 @@ def classify_owner(owner: str | None) -> str:
     # Unresolved diarization labels (SPEAKER_00) aren't a real person.
     if o in _UNASSIGNED_TOKENS or _SPEAKER_LABEL_RE.match(o):
         return "unassigned"
-    if _ME_MATCHER and _ME_MATCHER.search(owner or ""):
+    matcher = _me_matcher()
+    if matcher and matcher.search(owner or ""):
         return "mine"
     return "waiting"
 
@@ -142,11 +174,13 @@ class ActionItem:
     note_title: str
     note_date: str
     line_no: int       # 0-based line index in the source file (for write-back)
-    bucket: str = "unassigned"   # 'mine' | 'waiting' | 'unassigned' | 'merged'
+    bucket: str = "unassigned"   # 'mine' | 'waiting' | 'unassigned' | 'merged' | 'someday'
     note: str = ""     # optional user-added annotation (stored inline in the .md)
     merge_id: str = ""           # shared id when consolidated with other to-dos
     merge_primary: bool = False  # the canonical row of its merge group
     sources: list = field(default_factory=list)  # folded members (set at render)
+    someday_state: str = ""      # '' | 'review' (flagged, awaiting triage) | 'parked'
+    someday_kind: str = ""       # suggested kind while in review: 'idea' | 'todo'
 
 
 @dataclass
@@ -159,6 +193,7 @@ class Note:
     topics: list[str]
     duration: str
     body: str
+    category: str = ""   # LLM-inferred kind label (Phone call, Voice note, …)
     meta: dict = field(default_factory=dict)
 
 
@@ -208,6 +243,7 @@ def load_notes() -> list[Note]:
             topics=[str(t) for t in topics],
             duration=str(meta.get("duration", "")),
             body=body,
+            category=str(meta.get("category", "")),
             meta=meta if isinstance(meta, dict) else {},
         ))
     return notes
@@ -230,7 +266,8 @@ def _rewrite_item(filename: str, line_no: int, **changes) -> bool:
     p = _parse_item(m.group("text"))
     p.update(changes)
     inner = _compose_item(p["task"], p["owner"], p["deadline"],
-                          p["note"], p["merge_id"], p["merge_primary"])
+                          p["note"], p["merge_id"], p["merge_primary"],
+                          p["someday_state"], p["someday_kind"])
     lines[line_no] = f"{m.group('indent')}- [{m.group('mark')}] {inner}"
     open(path, "w", encoding="utf-8").write("\n".join(lines))
     return True
@@ -255,13 +292,21 @@ def action_items(include_done: bool = False) -> list[ActionItem]:
                 continue
             inner = m.group("text")
             p = _parse_item(inner)
-            # Folded (non-primary) merge members are hidden from the normal buckets.
-            bucket = "merged" if (p["merge_id"] and not p["merge_primary"]) else classify_owner(p["owner"])
+            # Someday-tagged items (flagged for review or parked) live in their own
+            # bucket — never in the Action Center. Folded (non-primary) merge
+            # members are likewise hidden from the normal owner buckets.
+            if p["someday_state"]:
+                bucket = "someday"
+            elif p["merge_id"] and not p["merge_primary"]:
+                bucket = "merged"
+            else:
+                bucket = classify_owner(p["owner"])
             items.append(ActionItem(
                 text=p["task"], raw=inner, done=done, owner=p["owner"], deadline=p["deadline"],
                 note_filename=note.filename, note_title=note.title,
                 note_date=note.date, line_no=i, bucket=bucket,
                 note=p["note"] or "", merge_id=p["merge_id"], merge_primary=p["merge_primary"],
+                someday_state=p["someday_state"], someday_kind=p["someday_kind"],
             ))
     return items
 
@@ -314,6 +359,38 @@ def set_note(filename: str, line_no: int, note: str) -> bool:
     return _rewrite_item(filename, line_no, note=note)
 
 
+def set_note_title(filename: str, title: str) -> bool:
+    """Rename a note's *displayed* title in place — the frontmatter `title:` and
+    the body's first `# ` heading. The filename is left untouched (the whole app
+    keys off it), so only the human-facing title changes. Returns True on success.
+    """
+    d = notes_dir()
+    path = os.path.normpath(os.path.join(d, filename))
+    if os.path.dirname(path) != os.path.normpath(d) or not os.path.isfile(path):
+        return False
+    new_title = " ".join((title or "").split()).strip()
+    if not new_title:
+        return False
+    quoted = json.dumps(new_title, ensure_ascii=False)  # a valid single-line YAML scalar
+    lines = open(path, encoding="utf-8").read().split("\n")
+    title_done = h1_done = False
+    fences = 0  # 0 = pre-frontmatter, 1 = inside it, 2+ = body
+    for i, line in enumerate(lines):
+        if line.rstrip() == "---":
+            fences += 1
+            continue
+        if not title_done and fences == 1 and re.match(r"^title:\s", line):
+            lines[i] = f"title: {quoted}"
+            title_done = True
+        elif not h1_done and fences >= 2 and re.match(r"^#\s+\S", line):
+            lines[i] = f"# {new_title}"
+            h1_done = True
+    if not (title_done or h1_done):
+        return False
+    open(path, "w", encoding="utf-8").write("\n".join(lines))
+    return True
+
+
 def set_merge(filename: str, line_no: int, merge_id: str, primary: bool = False) -> bool:
     """Tag the action item at filename:line_no as part of merge group `merge_id`
     (the `primary` one is the canonical/displayed row)."""
@@ -323,6 +400,40 @@ def set_merge(filename: str, line_no: int, merge_id: str, primary: bool = False)
 def clear_merge(filename: str, line_no: int) -> bool:
     """Remove any merge tag from the action item at filename:line_no (unmerge)."""
     return _rewrite_item(filename, line_no, merge_id="", merge_primary=False)
+
+
+def delete_note(filename: str) -> bool:
+    """Soft-delete a note: move its .md into notes/.trash/ (recoverable, and hidden
+    from both Scribe and Obsidian since dot-folders are ignored). Returns True on
+    success.
+
+    Before moving, un-merge any consolidated to-do groups this note took part in —
+    otherwise a merged item in *another* note could be left folded with no primary
+    to display it, making it silently vanish from the Action Center. The note's own
+    transcript and audio are left in place (orphaned, governed by retention).
+    """
+    d = notes_dir()
+    path = os.path.normpath(os.path.join(d, filename))
+    if os.path.dirname(path) != os.path.normpath(d) or not os.path.isfile(path):
+        return False
+
+    gids = {it.merge_id for it in action_items(include_done=True)
+            if it.note_filename == filename and it.merge_id}
+    if gids:
+        for it in action_items(include_done=True):
+            if it.merge_id in gids and it.note_filename != filename:
+                clear_merge(it.note_filename, it.line_no)
+
+    trash = os.path.join(d, ".trash")
+    os.makedirs(trash, exist_ok=True)
+    dest = os.path.join(trash, filename)
+    n = 2
+    while os.path.exists(dest):  # never clobber a previously-trashed note
+        stem, ext = os.path.splitext(filename)
+        dest = os.path.join(trash, f"{stem}-{n}{ext}")
+        n += 1
+    shutil.move(path, dest)
+    return True
 
 
 def _parse_note_date(value) -> "date | None":
@@ -344,8 +455,10 @@ def recent_notes(days: int = 14) -> list[Note]:
 
 
 def items_with_deadlines(include_done: bool = False) -> list[ActionItem]:
-    """Open action items that carry a deadline string (any bucket)."""
-    return [it for it in action_items(include_done=include_done) if it.deadline]
+    """Action items that carry a deadline string. Someday items (not yet committed)
+    are excluded so unconfirmed ideas don't surface on the deadline radar."""
+    return [it for it in action_items(include_done=include_done)
+            if it.deadline and it.bucket != "someday"]
 
 
 # ─── deadline date parsing ──────────────────────────────────────────────────
@@ -416,19 +529,155 @@ def deadline_view(items: list[ActionItem], today: "date | None" = None) -> list[
 
 def stats() -> dict:
     notes = load_notes()
-    # Folded merge members aren't counted — a consolidated group counts once,
-    # via its primary (which keeps its real owner bucket).
-    all_items = [it for it in action_items(include_done=True) if it.bucket != "merged"]
-    open_items = [it for it in all_items if not it.done]
+    items = action_items(include_done=True)
+    # Folded merge members aren't counted — a consolidated group counts once, via
+    # its primary. Someday items (review/parked) are their own world, never the
+    # Action Center, so they're excluded from the open/done tallies too.
+    actionable = [it for it in items if it.bucket not in ("merged", "someday")]
+    open_items = [it for it in actionable if not it.done]
     counts = {"mine": 0, "waiting": 0, "unassigned": 0}
     for it in open_items:
         counts[it.bucket] = counts.get(it.bucket, 0) + 1
+    review = sum(1 for it in items
+                 if it.bucket == "someday" and it.someday_state == "review" and not it.done)
     return {
         "note_count": len(notes),
         "open_action_items": len(open_items),
         "buckets": counts,
-        "done": len(all_items) - len(open_items),
+        "done": len(actionable) - len(open_items),
+        "someday_review": review,
     }
+
+
+def someday_items(state: str = "", include_done: bool = False) -> list[ActionItem]:
+    """Items in the someday bucket — flagged review candidates and parked ideas.
+    Filter to a single state ('review' | 'parked') when given. Newest note first."""
+    out = [it for it in action_items(include_done=include_done) if it.bucket == "someday"]
+    if state:
+        out = [it for it in out if it.someday_state == state]
+    return out
+
+
+def idea_notes(include_archived: bool = False) -> list[Note]:
+    """Dedicated idea-session notes (frontmatter type == 'idea'). Archived ideas
+    are hidden from Someday by default but remain in All Notes."""
+    out = [n for n in load_notes() if (n.type or "").lower() == "idea"]
+    if not include_archived:
+        out = [n for n in out if not n.meta.get("archived")]
+    return out
+
+
+def note_by_filename(filename: str) -> "Note | None":
+    for n in load_notes():
+        if n.filename == filename:
+            return n
+    return None
+
+
+def developed_sessions(idea_filename: str) -> list[Note]:
+    """Notes recorded by developing the given idea (frontmatter from_idea → it)."""
+    return [n for n in load_notes() if str(n.meta.get("from_idea") or "") == idea_filename]
+
+
+def set_category(filename: str, category: str) -> bool:
+    """Add/replace the `category` frontmatter line on a note (nothing else touched).
+    Non-destructive — preserves the body, checkmarks, merges, and inline notes."""
+    d = notes_dir()
+    path = os.path.normpath(os.path.join(d, filename))
+    if os.path.dirname(path) != os.path.normpath(d) or not os.path.isfile(path):
+        return False
+    cat = " ".join((category or "").split()).strip()
+    if not cat:
+        return False
+    quoted = json.dumps(cat, ensure_ascii=False)
+    lines = open(path, encoding="utf-8").read().split("\n")
+    if not lines or lines[0].strip() != "---":
+        return False
+    out, fences, done = [], 0, False
+    for line in lines:
+        if line.rstrip() == "---":
+            fences += 1
+            if fences == 2 and not done:
+                out.append(f"category: {quoted}")   # no existing line — add before close
+                done = True
+            out.append(line)
+            continue
+        if fences == 1 and not done and re.match(r"^category:\s", line):
+            out.append(f"category: {quoted}")        # replace existing
+            done = True
+            continue
+        out.append(line)
+    open(path, "w", encoding="utf-8").write("\n".join(out))
+    return True
+
+
+def set_archived(filename: str, archived: bool) -> bool:
+    """Set/unset the `archived` frontmatter flag on a note. Archiving an idea
+    removes it from Someday while leaving it in All Notes; restoring brings it back.
+    """
+    d = notes_dir()
+    path = os.path.normpath(os.path.join(d, filename))
+    if os.path.dirname(path) != os.path.normpath(d) or not os.path.isfile(path):
+        return False
+    lines = open(path, encoding="utf-8").read().split("\n")
+    if not lines or lines[0].strip() != "---":
+        return False
+    out, fences, done = [], 0, False
+    for line in lines:
+        if line.rstrip() == "---":
+            fences += 1
+            if fences == 2 and archived and not done:
+                out.append("archived: true")   # add just before the closing fence
+                done = True
+            out.append(line)
+            continue
+        if fences == 1 and re.match(r"^archived:\s", line):
+            continue  # drop any existing flag (re-added above if still archiving)
+        out.append(line)
+    open(path, "w", encoding="utf-8").write("\n".join(out))
+    return True
+
+
+def confirm_idea(filename: str, line_no: int) -> bool:
+    """Triage: keep a flagged item as a parked Someday idea (review -> parked)."""
+    return _rewrite_item(filename, line_no, someday_state="parked", someday_kind="")
+
+
+def confirm_todo(filename: str, line_no: int, owner: str = "", deadline: str = "") -> bool:
+    """Triage: promote a flagged item into a live Action Center to-do.
+
+    Strips the someday tag (so it re-buckets by owner) and optionally sets the
+    owner and deadline the user supplied at convert time.
+    """
+    changes = {"someday_state": "", "someday_kind": ""}
+    label = (owner or "").strip()
+    if label:
+        changes["owner"] = label
+    dl = (deadline or "").strip()
+    if dl:
+        changes["deadline"] = dl
+    return _rewrite_item(filename, line_no, **changes)
+
+
+def dismiss_item(filename: str, line_no: int) -> bool:
+    """Triage: delete a flagged Someday item's line from its note (declined).
+
+    Removing the line shifts the line numbers of any later items in that file, so
+    callers must re-read items afterward — the dashboard re-renders the whole list,
+    so cached line_no values are never reused across a dismiss.
+    """
+    d = notes_dir()
+    path = os.path.normpath(os.path.join(d, filename))
+    if os.path.dirname(path) != os.path.normpath(d) or not os.path.isfile(path):
+        return False
+    lines = open(path, encoding="utf-8").read().split("\n")
+    if line_no < 0 or line_no >= len(lines):
+        return False
+    if not _CHECKBOX_RE.match(lines[line_no]):
+        return False
+    del lines[line_no]
+    open(path, "w", encoding="utf-8").write("\n".join(lines))
+    return True
 
 
 def to_dict(obj) -> dict:

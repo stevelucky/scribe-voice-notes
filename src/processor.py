@@ -371,3 +371,65 @@ class Processor:
         final["_section_count"] = total
         return final
 
+
+_CLASSIFY_SYSTEM = """You route a voice transcript to the right note template. Decide which ONE it is:
+
+- "idea": one person thinking out loud about a longer-term idea, product, or project they might pursue SOMEDAY but are not actively working on right now — exploring a concept, riffing on "what if we built X", capturing a someday/maybe ambition.
+- "meeting": everything else — a meeting, call, standup, 1:1, interview, or a voice note about current or ongoing work, tasks, and decisions.
+
+Most recordings are "meeting". Choose "idea" ONLY when the whole recording is clearly one person exploring a future idea, not doing or discussing present work.
+
+Reply with ONLY this JSON: {"type": "idea"} or {"type": "meeting"}."""
+
+
+def classify_recording(transcript_text: str, max_chars: int = 4000) -> str:
+    """Best-effort binary classification of a transcript: 'idea' or 'meeting'.
+
+    Used by the auto-type path (imported audio files / phone recordings, which
+    carry no explicit capture mode). Sends only the opening of the transcript to
+    bound tokens, and falls back to 'meeting' on any error so a classifier hiccup
+    never blocks processing.
+    """
+    text = (transcript_text or "").strip()
+    if not text:
+        return "meeting"
+    cfg = CONFIG["processing"]
+    try:
+        raw = _call_llm(cfg.get("provider", "gemini"), cfg["model"],
+                        _CLASSIFY_SYSTEM, text[:max_chars], 0.0)
+        data = Processor._parse_json_response(raw)
+        if isinstance(data, dict) and str(data.get("type", "")).strip().lower() == "idea":
+            print("[classify] Detected: idea", file=sys.stderr)
+            return "idea"
+    except Exception as e:
+        print(f"[classify] failed ({e}); defaulting to meeting.", file=sys.stderr)
+    print("[classify] Detected: meeting", file=sys.stderr)
+    return "meeting"
+
+
+_CATEGORY_SYSTEM = """You label what KIND of recording a transcript is.
+
+Reply with ONLY this JSON: {"category": "<label>"}.
+
+Choose the best short (1-3 word) label, preferring one of: Meeting, Phone call, Voice note, 1:1, Interview, Standup, Brainstorm. Use another short label only if none truly fit.
+Guidance: a customer-service or personal phone call → "Phone call"; a single-speaker memo or note-to-self → "Voice note"; a multi-person sync or discussion → "Meeting"."""
+
+
+def classify_category(text: str, max_chars: int = 3000) -> str:
+    """Infer a short 'kind of recording' label (Phone call, Meeting, Voice note, …)
+    for an existing note. Returns '' on empty input or any error, so a backfill
+    never mislabels on a hiccup."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    cfg = CONFIG["processing"]
+    try:
+        raw = _call_llm(cfg.get("provider", "gemini"), cfg["model"],
+                        _CATEGORY_SYSTEM, t[:max_chars], 0.0)
+        data = Processor._parse_json_response(raw)
+        if isinstance(data, dict):
+            return str(data.get("category", "")).strip()[:40]
+    except Exception as e:
+        print(f"[classify] category failed ({e})", file=sys.stderr)
+    return ""
+

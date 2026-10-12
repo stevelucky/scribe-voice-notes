@@ -33,6 +33,13 @@ move anything that becomes an architecture decision into `docs/adr/`.
 
 ## Done
 
+- **Diarization no longer loses long-meeting notes to GPU OOM.** pyannote on MPS
+  hit `MPS backend out of memory` on long files, crashing the whole pipeline (the
+  transcribed note was lost). Now: MPS gets full-memory headroom
+  (`PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`), an OOM retries once on CPU, and the
+  diarization step is non-fatal — on any failure the note is still written, just
+  without speaker labels (`_apply_diarization` in `cli.py`). Same CPU fallback on
+  the speaker-embedding path.
 - Fixed `process_chunked` crash (called a nonexistent `self._call_llm`).
 - Hardened the MCP server against path traversal and malformed-note parse errors.
 - Enforced `recording.max_duration_minutes` as a safety cap.

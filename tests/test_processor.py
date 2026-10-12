@@ -169,6 +169,39 @@ def test_process_chunked_uses_module_level_call_llm():
     assert result["_chunked"] is True
 
 
+# ─── classify_recording (auto-type) ──────────────────────────────────────────
+
+def test_classify_recording_detects_idea():
+    from src.processor import classify_recording
+    with patch("src.processor._call_llm", return_value='{"type": "idea"}'):
+        assert classify_recording("what if we built an app someday") == "idea"
+
+
+def test_classify_recording_detects_meeting():
+    from src.processor import classify_recording
+    with patch("src.processor._call_llm", return_value='{"type": "meeting"}'):
+        assert classify_recording("standup notes, blockers, etc.") == "meeting"
+
+
+def test_classify_recording_defaults_to_meeting_on_error():
+    from src.processor import classify_recording
+    with patch("src.processor._call_llm", side_effect=RuntimeError("boom")):
+        assert classify_recording("anything") == "meeting"
+
+
+def test_classify_recording_defaults_to_meeting_on_unexpected_json():
+    from src.processor import classify_recording
+    with patch("src.processor._call_llm", return_value='{"type": "banana"}'):
+        assert classify_recording("anything") == "meeting"
+
+
+def test_classify_recording_empty_is_meeting_without_llm_call():
+    from src.processor import classify_recording
+    with patch("src.processor._call_llm") as m:
+        assert classify_recording("   ") == "meeting"
+    m.assert_not_called()
+
+
 def test_process_chunked_single_chunk_falls_back_to_single_pass():
     p = _make_processor()
     transcript = {

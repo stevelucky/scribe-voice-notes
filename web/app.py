@@ -9,27 +9,42 @@ Run from the repo root:
 Then open http://localhost:8000
 """
 
+import asyncio
 import os
 import re
+import shutil
+import sys
+import tempfile
 from collections import OrderedDict
 from datetime import date, datetime
 
 import markdown as _md
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from src import config as _config
 from src import notes_index as ni
 from src import brief as brief_mod
 from src import corrections as corr
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE)
 _STATIC = os.path.join(_HERE, "static")
 templates = Jinja2Templates(directory=os.path.join(_HERE, "templates"))
 
 app = FastAPI(title="Scribe")
 app.mount("/static", StaticFiles(directory=_STATIC), name="static")
+
+
+@app.middleware("http")
+async def _refresh_config(request: Request, call_next):
+    # Pick up config.yaml edits made while the server runs (e.g. the menu bar's
+    # Settings → Identity), so "Mine" vs "Waiting" bucketing stays live without
+    # a restart. A cheap mtime check; only re-reads the file when it changed.
+    _config.maybe_reload()
+    return await call_next(request)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -72,7 +87,7 @@ def _group_items(bucket: str = "mine", query: str = "", limit: "int | None" = No
             folded_by_gid.setdefault(it.merge_id, []).append(it)
 
     if bucket == "done":
-        items = [it for it in all_items if it.done and it.bucket != "merged"]
+        items = [it for it in all_items if it.done and it.bucket not in ("merged", "someday")]
     else:
         items = [it for it in all_items if not it.done and it.bucket == bucket]
     for it in items:
@@ -278,13 +293,32 @@ def set_item_note(request: Request, filename: str = Form(...), line_no: int = Fo
     return templates.TemplateResponse(request, "_item.html", _row_ctx(item, bucket, q))
 
 
+@app.post("/action-items/delete", response_class=HTMLResponse)
+def delete_action_item(request: Request, filename: str = Form(...), line_no: int = Form(...),
+                       bucket: str = Form("mine"), q: str = Form("")):
+    """Delete a to-do outright (e.g. one created by mistake). Removes the line and
+    re-renders the list (deleting shifts line numbers, so a full re-render is required)."""
+    items = ni.action_items(include_done=True)
+    target = next((it for it in items
+                   if it.note_filename == filename and it.line_no == line_no), None)
+    # If it's a consolidated (merge-primary) row, un-merge the group first so the
+    # folded members don't get orphaned (left tagged with no primary to show them).
+    if target and target.merge_id and target.merge_primary:
+        for it in items:
+            if it.merge_id == target.merge_id and not (it.note_filename == filename and it.line_no == line_no):
+                ni.clear_merge(it.note_filename, it.line_no)
+    ni.dismiss_item(filename, line_no)
+    return _render_item_list(request, bucket, q)
+
+
 @app.get("/action-items/merge-candidates", response_class=HTMLResponse)
 def merge_candidates(request: Request, filename: str, line_no: int,
                      bucket: str = "mine", q: str = ""):
     """The picker body: other open, non-folded to-dos that can fold into this one."""
     cands = [
         it for it in ni.action_items(include_done=False)
-        if it.bucket != "merged" and not (it.note_filename == filename and it.line_no == line_no)
+        if it.bucket not in ("merged", "someday")
+        and not (it.note_filename == filename and it.line_no == line_no)
     ]
     return templates.TemplateResponse(request, "_merge_candidates.html", {
         "candidates": cands, "primary_filename": filename, "primary_line_no": line_no,
@@ -408,7 +442,17 @@ def _diff_rows(before: str, after: str) -> list[dict]:
     return rows
 
 
-def _render_note(request: Request, filename: str, result: dict | None = None):
+# Maps a `from` entry-point key to the breadcrumb back-link (href, label).
+_FROM_MAP = {
+    "brief": ("/", "This Week"),
+    "notes": ("/notes", "All notes"),
+    "someday": ("/someday", "Someday"),
+    "actions": ("/actions", "Action Center"),
+}
+
+
+def _render_note(request: Request, filename: str, result: dict | None = None,
+                 origin_from: str = ""):
     path = corr.resolve_note(filename)
     if not path:
         return HTMLResponse("Note not found.", status_code=404)
@@ -428,6 +472,33 @@ def _render_note(request: Request, filename: str, result: dict | None = None):
             except OSError:
                 diff = None
 
+    # Breadcrumb: honor where the user came from (`from` param) when known; else
+    # fall back to type — a live idea note belongs to Someday, everything else to
+    # All Notes.
+    is_idea = str(meta.get("type", "")).lower() == "idea"
+    archived = bool(meta.get("archived"))
+    if origin_from in _FROM_MAP:
+        back_href, back_label = _FROM_MAP[origin_from]
+    else:
+        back_href, back_label = ("/someday", "Someday") if (is_idea and not archived) else ("/notes", "All notes")
+
+    # Backlinks: an idea lists the sessions developed from it (each with an inline,
+    # expandable preview so you can review prior work without leaving the page);
+    # a session links back to the idea it came from.
+    developed = []
+    if is_idea:
+        for s in ni.developed_sessions(filename):
+            note_part, _ = _split_note_body(s.body)
+            developed.append({
+                "filename": s.filename, "title": s.title, "date": s.date,
+                "preview_html": _render_md(note_part),
+            })
+    origin = None
+    fi = meta.get("from_idea")
+    if fi:
+        on = ni.note_by_filename(str(fi))
+        origin = {"filename": str(fi), "title": on.title if on else str(fi)}
+
     return templates.TemplateResponse(request, "note.html", {
         "nav": "",
         "filename": filename,
@@ -438,22 +509,162 @@ def _render_note(request: Request, filename: str, result: dict | None = None):
         "has_backup": corr.has_backup(filename),
         "result": result,
         "diff": diff,
+        "back_href": back_href,
+        "back_label": back_label,
+        "origin_from": origin_from if origin_from in _FROM_MAP else "",
+        "is_idea": is_idea,
+        "archived": archived,
+        "developed": developed,
+        "origin": origin,
     })
 
 
 @app.get("/note", response_class=HTMLResponse)
-def note_detail(request: Request, file: str):
-    return _render_note(request, file)
+def note_detail(request: Request, file: str, origin: str = Query("", alias="from")):
+    return _render_note(request, file, origin_from=origin)
 
 
 @app.post("/note/correct", response_class=HTMLResponse)
-def note_correct(request: Request, filename: str = Form(...), correction: str = Form(...)):
+def note_correct(request: Request, filename: str = Form(...), correction: str = Form(...),
+                 origin: str = Form("", alias="from")):
     res = corr.correct_note(filename, correction)
-    return _render_note(request, filename, result=res)
+    return _render_note(request, filename, result=res, origin_from=origin)
 
 
 @app.post("/note/undo", response_class=HTMLResponse)
-def note_undo(request: Request, filename: str = Form(...)):
+def note_undo(request: Request, filename: str = Form(...), origin: str = Form("", alias="from")):
     ok = corr.undo(filename)
     res = {"ok": ok, "undo": True} if ok else {"ok": False, "error": "Nothing to undo."}
-    return _render_note(request, filename, result=res)
+    return _render_note(request, filename, result=res, origin_from=origin)
+
+
+@app.post("/note/delete")
+def note_delete(filename: str = Form(...)):
+    """Soft-delete a note (move to notes/.trash) and return to its home list."""
+    path = corr.resolve_note(filename)
+    target = "/notes"
+    if path:
+        meta, _ = ni._parse_frontmatter(open(path, encoding="utf-8").read())
+        if str(meta.get("type", "")).lower() == "idea":
+            target = "/someday"
+    ni.delete_note(filename)
+    return RedirectResponse(target, status_code=303)
+
+
+@app.post("/note/archive")
+def note_archive(filename: str = Form(...), archived: bool = Form(True)):
+    """Archive an idea (leaves Someday, stays in All Notes) or restore it."""
+    ni.set_archived(filename, archived)
+    # After archiving go to All Notes; after restoring, back to Someday.
+    return RedirectResponse("/notes" if archived else "/someday", status_code=303)
+
+
+@app.post("/idea/develop")
+async def idea_develop(filename: str = Form(...), audio: UploadFile = File(...)):
+    """Record-in-browser → develop a Someday idea into an actionable session note.
+
+    Saves the uploaded audio, runs the normal pipeline as a subprocess (default
+    type → real to-dos) linked back to the idea via --from-idea, and returns the
+    new note's filename for the browser to navigate to.
+    """
+    if corr.resolve_note(filename) is None:
+        return JSONResponse({"ok": False, "error": "Idea not found."}, status_code=400)
+
+    suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        shutil.copyfileobj(audio.file, tmp)
+        tmp.close()
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "src.cli", "process", tmp.name,
+            "--type", "default", "--from-idea", filename, "--no-slack",
+            cwd=_PROJECT_ROOT,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            tail = (err.decode(errors="replace").strip().splitlines() or ["Processing failed."])
+            # surface the last non-JSON-marker line as the human error
+            msg = next((l for l in reversed(tail) if not l.lstrip().startswith("{")), tail[-1])
+            return JSONResponse({"ok": False, "error": msg}, status_code=500)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+    sessions = ni.developed_sessions(filename)
+    if not sessions:
+        return JSONResponse({"ok": False, "error": "Processed, but couldn't locate the new note."}, status_code=500)
+    return JSONResponse({"ok": True, "note": sessions[0].filename})
+
+
+@app.post("/note/title", response_class=HTMLResponse)
+def note_title(request: Request, filename: str = Form(...), title: str = Form(...)):
+    """Rename a note's displayed title (frontmatter + H1) and re-render the header."""
+    ni.set_note_title(filename, title)
+    return _render_note_header(request, filename)
+
+
+@app.post("/note/category", response_class=HTMLResponse)
+def note_category(request: Request, filename: str = Form(...), category: str = Form("")):
+    """Re-tag a general note's category (frontmatter only) and re-render the header."""
+    if category.strip():
+        ni.set_category(filename, category)
+    return _render_note_header(request, filename)
+
+
+def _render_note_header(request: Request, filename: str) -> HTMLResponse:
+    path = corr.resolve_note(filename)
+    meta = {}
+    if path:
+        meta, _ = ni._parse_frontmatter(open(path, encoding="utf-8").read())
+    return templates.TemplateResponse(request, "_note_header.html", {
+        "filename": filename, "title": meta.get("title", filename), "meta": meta,
+    })
+
+
+# ─── Someday: long-term ideas + the review queue ────────────────────────────
+
+def _someday_ctx() -> dict:
+    """Everything the Someday page (and its triage partial) needs: the review
+    queue, parked ideas from meetings, and dedicated idea-session notes."""
+    return {
+        "nav": "someday",
+        "review": ni.someday_items(state="review"),
+        "parked": ni.someday_items(state="parked"),
+        "ideas": ni.idea_notes(),
+        **_reassign_ctx(),
+    }
+
+
+def _render_someday_body(request: Request) -> HTMLResponse:
+    """Re-render just the page body after a triage action (htmx swap target)."""
+    return templates.TemplateResponse(request, "_someday.html", _someday_ctx())
+
+
+@app.get("/someday", response_class=HTMLResponse)
+def someday(request: Request):
+    return templates.TemplateResponse(request, "someday.html", _someday_ctx())
+
+
+@app.post("/someday/confirm-idea", response_class=HTMLResponse)
+def someday_confirm_idea(request: Request, filename: str = Form(...), line_no: int = Form(...)):
+    """Keep a flagged item as a parked Someday idea."""
+    ni.confirm_idea(filename, line_no)
+    return _render_someday_body(request)
+
+
+@app.post("/someday/confirm-todo", response_class=HTMLResponse)
+def someday_confirm_todo(request: Request, filename: str = Form(...), line_no: int = Form(...),
+                         owner: str = Form(""), deadline: str = Form("")):
+    """Promote a flagged item into a live Action Center to-do (with owner/deadline)."""
+    ni.confirm_todo(filename, line_no, owner=owner, deadline=deadline)
+    return _render_someday_body(request)
+
+
+@app.post("/someday/dismiss", response_class=HTMLResponse)
+def someday_dismiss(request: Request, filename: str = Form(...), line_no: int = Form(...)):
+    """Decline a flagged item — delete it from its note."""
+    ni.dismiss_item(filename, line_no)
+    return _render_someday_body(request)

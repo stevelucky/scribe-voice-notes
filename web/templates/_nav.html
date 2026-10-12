@@ -1,14 +1,15 @@
-{# Masthead navigation. `nav` ∈ brief | actions | notes | '' (note detail). #}
+{# Masthead navigation. `nav` ∈ brief | actions | someday | notes | '' (note detail). #}
 <nav class="flex items-center gap-0.5 sm:gap-1 text-sm">
   {% set items = [
     ('brief',   '/',        'This Week',     'M8 2v3M16 2v3M3.5 9h17M5 5h14a1.5 1.5 0 0 1 1.5 1.5V19A1.5 1.5 0 0 1 19 20.5H5A1.5 1.5 0 0 1 3.5 19V6.5A1.5 1.5 0 0 1 5 5Z'),
     ('actions', '/actions', 'Action Center', 'M9 11l2.5 2.5L17 8M5 4h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Z'),
+    ('someday', '/someday',  'Someday',      'M9 18h6M10 21h4M8.5 14a5.5 5.5 0 1 1 7 0c-.7.55-1 1.2-1 2h-5c0-.8-.3-1.45-1-2Z'),
     ('notes',   '/notes',   'All Notes',     'M7 4h8l4 4v11a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1ZM14 4v4h4M8.5 13h7M8.5 16.5h7'),
   ] %}
   {% for key, href, label, path in items %}
   <a href="{{ href }}"
-     class="group relative flex items-center gap-1.5 px-2.5 sm:px-3 py-2 rounded-lg font-medium transition-colors
-            {% if nav == key %}text-accent{% else %}text-ink-soft hover:text-ink hover:bg-line/50{% endif %}"
+     class="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 rounded-lg font-medium transition-colors
+            {% if nav == key %}bg-accent-tint text-accent ring-1 ring-accent/15{% else %}text-ink-soft hover:text-ink hover:bg-line/50{% endif %}"
      {% if nav == key %}aria-current="page"{% endif %} aria-label="{{ label }}">
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
          stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -18,10 +19,12 @@
     {% if key == 'actions' %}
     <span data-open-count style="display:none"
           class="ml-0.5 min-w-[1.1rem] text-center text-[11px] font-mono font-medium rounded-full px-1
-                 {% if nav == key %}bg-accent-tint text-accent{% else %}bg-line text-ink-soft{% endif %}"></span>
+                 {% if nav == key %}bg-accent text-paper{% else %}bg-line text-ink-soft{% endif %}"></span>
     {% endif %}
-    {% if nav == key %}
-    <span class="absolute left-2.5 right-2.5 -bottom-px h-0.5 rounded-full bg-accent"></span>
+    {% if key == 'someday' %}
+    <span data-someday-count style="display:none"
+          class="ml-0.5 min-w-[1.1rem] text-center text-[11px] font-mono font-medium rounded-full px-1
+                 {% if nav == key %}bg-accent text-paper{% else %}bg-line text-ink-soft{% endif %}"></span>
     {% endif %}
   </a>
   {% endfor %}

@@ -93,6 +93,9 @@
     .spin { animation: scribe-spin .8s linear infinite; }
     @keyframes scribe-spin { to { transform: rotate(360deg); } }
 
+    /* Live input equalizer in the Develop-an-idea recorder. */
+    .dev-eq i { width: 2px; height: 15%; background: currentColor; border-radius: 1px; transition: height 90ms linear; }
+
     /* Hide the scrollbar on horizontally-scrollable strips (mobile tabs). */
     .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
     .no-scrollbar::-webkit-scrollbar { display: none; }
@@ -153,7 +156,7 @@
     <div class="max-w-3xl mx-auto px-5 h-14 flex items-center justify-between gap-3">
       <a href="/" class="flex items-center gap-2.5 shrink-0" aria-label="Scribe — This Week">
         <img src="/static/logo.png" alt="" width="28" height="28" class="block dark:invert" aria-hidden="true">
-        <span class="font-display text-2xl font-semibold tracking-tight text-ink leading-none">Scribe</span>
+        <span class="font-display text-3xl font-semibold tracking-tight text-ink leading-none translate-y-[2px]">Scribe</span>
       </a>
       <div class="flex items-center gap-1">
         {% include "_nav.html" %}
@@ -178,9 +181,24 @@
     </div>
   </header>
 
-  <main class="max-w-3xl mx-auto px-5 py-8 sm:py-10">
+  <main class="max-w-3xl mx-auto px-5 pt-5 sm:pt-6 pb-8 sm:pb-10">
     {% block content %}{% endblock %}
   </main>
+
+  {# Custom confirm dialog — replaces native confirm() for hx-confirm and
+     [data-confirm] forms so prompts match the site's design. #}
+  <div id="scribe-modal" style="display:none" class="fixed inset-0 z-50 items-center justify-center p-4">
+    <div class="absolute inset-0 bg-ink/40 backdrop-blur-sm" onclick="scribeModalCancel()"></div>
+    <div class="relative bg-surface border border-line rounded-2xl shadow-xl max-w-sm w-full p-5" role="dialog" aria-modal="true">
+      <p id="scribe-modal-msg" class="text-sm text-ink leading-relaxed"></p>
+      <div class="mt-5 flex items-center justify-end gap-2">
+        <button type="button" onclick="scribeModalCancel()"
+                class="px-3 py-1.5 rounded-lg text-sm font-medium text-ink-soft hover:bg-line/50 transition-colors">Cancel</button>
+        <button type="button" id="scribe-modal-ok" onclick="scribeModalOk()"
+                class="btn-primary px-3.5 py-1.5 rounded-lg text-sm font-semibold">Confirm</button>
+      </div>
+    </div>
+  </div>
 
   <script>
     // Theme: cycle Auto → Light → Dark. "Auto" follows the OS (live).
@@ -237,21 +255,54 @@
       });
     }
 
-    // "N selected" count + enable/disable the Clear-completed button.
-    function scribeUpdateSelected() {
+    // Completing a to-do: checking marks it done immediately (the server writes
+    // [x]), then the row fades to the Done tab after a short grace window.
+    // Unchecking within the window cancels it. Timers are keyed by data-key so
+    // they survive the row's re-render after each toggle.
+    const _scribeDoneTimers = {};
+    const SCRIBE_DONE_DELAY = 6000;     // check in an open bucket → fade out to Done
+    const SCRIBE_RESTORE_DELAY = 2000;  // uncheck on the Done tab → fade back to to-dos
+    function _scribeSel(key) {
+      return '.item-row[data-key="' + (window.CSS && CSS.escape ? CSS.escape(key) : key) + '"]';
+    }
+    // A row "leaves" the current view when its checkbox stops matching it: in an
+    // open bucket a CHECKED row is departing to Done; on the Done tab an UNCHECKED
+    // row is being restored to the to-dos. Either way, hold full opacity at the
+    // click, fade out over a grace window (re-toggle to cancel), then collapse.
+    function scribeSyncDoneTimers() {
       const list = document.getElementById('item-list');
-      const n = list ? list.querySelectorAll('input[type="checkbox"]:checked').length : 0;
-      const box = document.getElementById('selected-count');
-      if (box) {
-        const num = box.querySelector('[data-selected]');
-        if (num) num.textContent = n;
-        box.style.display = n > 0 ? '' : 'none';
-      }
-      const clr = document.getElementById('clear-completed');
-      if (clr) {
-        clr.disabled = n === 0;
-        clr.title = n === 0 ? 'Check off items first' : 'Move checked-off items to the Done tab';
-      }
+      if (!list) return;
+      const onDoneTab = list.getAttribute('data-view-bucket') === 'done';
+      const delay = onDoneTab ? SCRIBE_RESTORE_DELAY : SCRIBE_DONE_DELAY;
+      list.querySelectorAll('.item-row[data-key]').forEach(row => {
+        const key = row.getAttribute('data-key');
+        const cb = row.querySelector('input[type="checkbox"]');
+        const checked = cb && cb.checked;
+        const leaving = onDoneTab ? !checked : checked;
+        if (leaving && !_scribeDoneTimers[key]) {
+          // Pin opacity:1 and force a reflow so the transition has a committed
+          // "from" state — without it the browser coalesces it into a jump.
+          row.style.transition = 'none';
+          row.style.opacity = '1';
+          void row.offsetWidth;
+          row.style.transition = 'opacity ' + delay + 'ms linear';
+          row.style.opacity = '0.08';
+          _scribeDoneTimers[key] = setTimeout(() => {
+            delete _scribeDoneTimers[key];
+            const r = list.querySelector(_scribeSel(key));
+            const c = r && r.querySelector('input[type="checkbox"]');
+            const stillLeaving = r && (onDoneTab ? !(c && c.checked) : (c && c.checked));
+            // Clear the slow fade's inline transition so the final collapse uses
+            // its own quick height/opacity animation.
+            if (stillLeaving) { r.style.transition = ''; scribeRemoveRow(r); setTimeout(scribeRefreshCounts, 360); }
+          }, delay);
+        } else if (!leaving && _scribeDoneTimers[key]) {
+          clearTimeout(_scribeDoneTimers[key]);
+          delete _scribeDoneTimers[key];
+          // Cancelled in time — drop the inline fade so the row returns to normal.
+          row.style.transition = ''; row.style.opacity = '';
+        }
+      });
     }
 
     function scribeRefreshCounts() {
@@ -270,8 +321,108 @@
           const v = (k === 'done') ? s.done : (s.buckets || {})[k];
           if (v !== undefined) el.textContent = v;
         });
+        // Someday review queue badge (only shows when something is waiting).
+        document.querySelectorAll('[data-someday-count]').forEach(el => {
+          const v = s.someday_review;
+          if (v !== undefined) {
+            el.textContent = v;
+            el.style.display = v > 0 ? '' : 'none';
+          }
+        });
       }).catch(() => {});
     }
+
+    // Inline note-title rename: swap the title for an input where it sits.
+    // Toggle via inline style.display — an author `.flex { display:flex }` rule
+    // beats the `hidden` attribute, so the attribute alone wouldn't hide the form.
+    function scribeStartRename(el) {
+      const root = el.closest('#note-header');
+      if (!root) return;
+      const disp = root.querySelector('[data-title-display]');
+      const eb = root.querySelector('[data-title-editbtn]');
+      const form = root.querySelector('[data-title-form]');
+      if (disp) disp.style.display = 'none';
+      if (eb) eb.style.display = 'none';
+      if (form) {
+        form.style.display = 'flex';
+        const inp = form.querySelector('[data-title-input]');
+        if (inp) { inp.focus(); inp.select(); }
+      }
+    }
+    function scribeCancelRename(btn) {
+      const root = btn.closest('#note-header');
+      if (!root) return;
+      const form = root.querySelector('[data-title-form]');
+      const disp = root.querySelector('[data-title-display]');
+      const eb = root.querySelector('[data-title-editbtn]');
+      if (form) form.style.display = 'none';
+      if (disp) disp.style.display = '';
+      if (eb) eb.style.display = '';
+    }
+
+    // Inline category re-tag (general notes): swap the category label for an input.
+    function scribeStartCat(el) {
+      const root = el.closest('#note-header');
+      if (!root) return;
+      const disp = root.querySelector('[data-cat-display]');
+      const form = root.querySelector('[data-cat-form]');
+      if (disp) disp.style.display = 'none';
+      if (form) {
+        form.style.display = '';
+        const inp = form.querySelector('[data-cat-input]');
+        if (inp) { inp.focus(); inp.select(); }
+      }
+    }
+    function scribeCancelCat(el) {
+      const root = el.closest('#note-header');
+      if (!root) return;
+      const form = root.querySelector('[data-cat-form]');
+      const disp = root.querySelector('[data-cat-display]');
+      if (form) form.style.display = 'none';
+      if (disp) disp.style.display = '';
+    }
+
+    // Custom confirm modal — replaces native confirm().
+    let _scribeConfirmCb = null;
+    function scribeConfirm(message, onConfirm) {
+      const m = document.getElementById('scribe-modal');
+      if (!m) { if (onConfirm) onConfirm(); return; }
+      document.getElementById('scribe-modal-msg').textContent = message || 'Are you sure?';
+      _scribeConfirmCb = onConfirm || null;
+      m.style.display = 'flex';
+      const ok = document.getElementById('scribe-modal-ok');
+      if (ok) ok.focus();
+    }
+    function scribeModalCancel() {
+      const m = document.getElementById('scribe-modal');
+      if (m) m.style.display = 'none';
+      _scribeConfirmCb = null;
+    }
+    function scribeModalOk() {
+      const cb = _scribeConfirmCb;
+      scribeModalCancel();
+      if (cb) cb();
+    }
+    document.addEventListener('keydown', (e) => {
+      const m = document.getElementById('scribe-modal');
+      if (!m || m.style.display === 'none') return;
+      if (e.key === 'Escape') { e.preventDefault(); scribeModalCancel(); }
+      else if (e.key === 'Enter') { e.preventDefault(); scribeModalOk(); }
+    });
+    // Route htmx's hx-confirm prompts through the custom modal.
+    document.body.addEventListener('htmx:confirm', (e) => {
+      if (!e.detail.question) return;            // element has no hx-confirm
+      e.preventDefault();
+      scribeConfirm(e.detail.question, () => e.detail.issueRequest(true));
+    });
+    // Route plain (non-htmx) [data-confirm] form submits through the modal too.
+    document.body.addEventListener('submit', (e) => {
+      const f = e.target;
+      if (f.matches && f.matches('form[data-confirm]') && !f.dataset.confirmed) {
+        e.preventDefault();
+        scribeConfirm(f.getAttribute('data-confirm'), () => { f.dataset.confirmed = '1'; f.submit(); });
+      }
+    });
 
     function scribeCollapse(el) {
       if (!el || el.classList.contains('archiving')) return;
@@ -292,21 +443,6 @@
       else scribeCollapse(row);
     }
 
-    function scribeClearCompleted() {
-      const list = document.getElementById('item-list');
-      if (!list) return;
-      list.querySelectorAll('section').forEach(section => {
-        const rows = section.querySelectorAll('.item-row');
-        const checked = section.querySelectorAll('.item-row input[type="checkbox"]:checked');
-        if (rows.length && checked.length === rows.length) {
-          scribeCollapse(section);
-        } else {
-          checked.forEach(cb => scribeRemoveRow(cb.closest('.item-row')));
-        }
-      });
-      setTimeout(() => { scribeUpdateSelected(); scribeRefreshCounts(); }, 360);
-    }
-
     function scribeReconcileMoved() {
       const list = document.getElementById('item-list');
       if (!list) return;
@@ -317,12 +453,9 @@
       });
     }
 
-    document.body.addEventListener('change', (e) => {
-      if (e.target.matches('#item-list input[type="checkbox"]')) scribeUpdateSelected();
-    });
     document.body.addEventListener('htmx:afterSwap', scribeReconcileMoved);
     document.body.addEventListener('htmx:afterRequest', (e) => {
-      scribeUpdateSelected();
+      scribeSyncDoneTimers();
       scribeRefreshCounts();
       // A consolidated duplicate group: drop its card from the panel and recount.
       const cfg = e.detail && e.detail.requestConfig;
@@ -332,7 +465,7 @@
         scribeAfterDupe();
       }
     });
-    scribeUpdateSelected();
+    scribeSyncDoneTimers();
     scribeRefreshCounts();
   </script>
 </body>

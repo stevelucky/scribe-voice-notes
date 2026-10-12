@@ -165,6 +165,7 @@ def identify_speakers(project_dir: str, diarized_segments: list, audio_path: str
 
 def _compute_embedding(audio_path: str) -> np.ndarray:
     """Compute a speaker embedding using wespeaker-voxceleb-resnet34-LM via pyannote."""
+    os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
     import torch
     from pyannote.audio import Model, Inference
 
@@ -178,10 +179,23 @@ def _compute_embedding(audio_path: str) -> np.ndarray:
     )
     inference = Inference(model, window="whole")
 
-    if torch.backends.mps.is_available():
+    use_mps = torch.backends.mps.is_available()
+    if use_mps:
         inference.to(torch.device("mps"))
 
-    embedding = inference(audio_path)
+    try:
+        embedding = inference(audio_path)
+    except (RuntimeError, MemoryError) as e:
+        if not use_mps or "out of memory" not in str(e).lower():
+            raise
+        print("[speakers] MPS out of memory computing an embedding — falling back to CPU.",
+              file=sys.stderr)
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+        inference.to(torch.device("cpu"))
+        embedding = inference(audio_path)
     return np.array(embedding)
 
 

@@ -56,16 +56,38 @@ final class LineAccumulator: @unchecked Sendable {
     init(image: NSImage) { self.image = image }
 }
 
+/// What the current recording is for. A meeting is processed normally (to-dos →
+/// Action Center); an idea session is processed with `--type idea` so it's
+/// captured idea-shaped and its rare to-dos are flagged for review, not auto-filed.
+enum CaptureMode {
+    case meeting, idea
+}
+
 @MainActor
 class RecordingManager: ObservableObject {
     static let shared = RecordingManager()
 
     @Published var isRecording = false
+    // Only changes on start/stop (a real state change), so it's safe on the
+    // dropdown's @Published graph alongside isRecording.
+    @Published var captureMode: CaptureMode = .meeting
+    // Paused state (silence auto-pause or a manual pause). Changes infrequently,
+    // so it's fine on the dropdown's @Published graph.
+    @Published var isPaused = false
+    private var pauseReason = ""    // "silent" | "manual" | "recording"
+    var pauseStatusText: String { pauseReason == "silent" ? "Paused (silent)" : "Paused" }
     @Published var lastNote: String?
     @Published var isProcessing = false
     @Published var processingStage: String = ""  // raw stage key from Python
     @Published var processingDetail: String = ""
     @Published var completedStages: Set<String> = []
+    @Published var transcribeProgress: Double = -1  // 0…1 during transcription; -1 = indeterminate
+    @Published var stageElapsed: Int = 0            // seconds spent in the current processing stage
+    private var stageStartedAt: Date?
+    private var processingTimer: Timer?
+    var stageElapsedText: String {
+        String(format: "%d:%02d", stageElapsed / 60, stageElapsed % 60)
+    }
     @Published var projectDir: String
     @Published var llmProvider: String = "LLM"
     @Published var lastError: String?
@@ -173,12 +195,13 @@ class RecordingManager: ObservableObject {
         }
     }
 
-    func startRecording() async {
+    func startRecording(mode: CaptureMode = .meeting) async {
         guard !isRecording else { return }
         guard !isProcessing, !isCorrecting else {
             sendNotification(title: "Scribe", body: "Still working on the last recording — try again in a moment.")
             return
         }
+        captureMode = mode
 
         // Snapshot existing recordings so a later cancel deletes only what we create.
         recordingsAtStart = currentRecordingFilenames()
@@ -199,6 +222,8 @@ class RecordingManager: ObservableObject {
         recordProcess = proc
 
         isRecording = true
+        isPaused = false
+        pauseReason = ""
         elapsedSeconds = 0
 
         // Per-second updates go to statusIcon only (not the dropdown's @Published graph).
@@ -216,7 +241,8 @@ class RecordingManager: ObservableObject {
             reason: "Scribe is recording audio"
         )
 
-        sendNotification(title: "Scribe", body: "Recording started. Press Cmd+Shift+R to stop.")
+        let what = mode == .idea ? "Idea session" : "Recording"
+        sendNotification(title: "Scribe", body: "\(what) started. Press Cmd+Shift+R to stop.")
     }
 
     // MARK: - Live meter
@@ -264,11 +290,65 @@ class RecordingManager: ObservableObject {
     nonisolated private func handleMeterLine(_ line: String) {
         guard line.hasPrefix("{"),
               let data = line.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let arr = obj["lvl"] as? [Any] else { return }
-        let bands = arr.compactMap { ($0 as? NSNumber)?.floatValue }
-        guard !bands.isEmpty else { return }
-        Task { @MainActor [weak self] in self?.updateMeter(bands) }
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let arr = obj["lvl"] as? [Any] {
+            let bands = arr.compactMap { ($0 as? NSNumber)?.floatValue }
+            if !bands.isEmpty { Task { @MainActor [weak self] in self?.updateMeter(bands) } }
+            return
+        }
+        if let paused = obj["paused"] as? Bool {
+            let reason = obj["reason"] as? String ?? ""
+            Task { @MainActor [weak self] in self?.updatePauseState(paused, reason: reason) }
+            return
+        }
+        if let capped = obj["capped"] as? Bool, capped {
+            let limit = (obj["limit_min"] as? NSNumber)?.intValue ?? 0
+            Task { @MainActor [weak self] in self?.handleCapReached(limitMin: limit) }
+        }
+    }
+
+    /// The recorder self-stopped at its max-duration cap. Notify the user and
+    /// process what was captured — don't interrupt (it's already finishing), just
+    /// wait for it to exit, then run the pipeline, so nothing is silently lost.
+    private func handleCapReached(limitMin: Int) {
+        guard isRecording else { return }
+        let limitText = (limitMin > 0 && limitMin % 60 == 0) ? "\(limitMin / 60)-hour"
+                      : (limitMin > 0 ? "\(limitMin)-minute" : "maximum")
+        sendNotification(title: "Scribe",
+                         body: "Recording hit the \(limitText) limit and stopped. Saving what was recorded — start a new recording to keep going.")
+        let proc = recordProcess
+        recordProcess = nil
+        timer?.invalidate(); timer = nil
+        isRecording = false
+        isPaused = false
+        pauseReason = ""
+        endSleepAssertion()
+        recordingsAtStart = []
+        Task { @MainActor in
+            if let proc, proc.isRunning { await Self.waitForExit(proc, timeout: 20) }
+            await processLatest()
+        }
+    }
+
+    /// Apply a pause-state transition from the recorder. Notifies once when the
+    /// recording auto-pauses on silence so the user isn't surprised by the gap.
+    private func updatePauseState(_ paused: Bool, reason: String) {
+        guard isRecording else { return }
+        let wasPaused = isPaused
+        isPaused = paused
+        pauseReason = reason
+        renderRecordingIcon()
+        if paused && !wasPaused && reason == "silent" {
+            sendNotification(title: "Scribe",
+                             body: "Recording paused — the room went quiet. It resumes as soon as you speak.")
+        }
+    }
+
+    /// Toggle a deliberate pause by signalling the recorder (SIGUSR1). The recorder
+    /// echoes the new state back on stdout, which updates the UI.
+    func togglePause() {
+        guard isRecording, let proc = recordProcess, proc.isRunning else { return }
+        kill(proc.processIdentifier, SIGUSR1)
     }
 
     /// Apply new band levels: track silence and repaint the icon (throttled).
@@ -296,8 +376,13 @@ class RecordingManager: ObservableObject {
     }
 
     private func renderRecordingIcon() {
-        statusIcon.image = Self.makeRecordingPillIcon(
-            time: formattedTime, bands: currentBands, warning: isSilent())
+        if isPaused {
+            statusIcon.image = Self.makePausedPillIcon(time: formattedTime)
+        } else {
+            statusIcon.image = Self.makeRecordingPillIcon(
+                time: formattedTime, bands: currentBands, warning: isSilent(),
+                idea: captureMode == .idea)
+        }
     }
 
     /// Filenames of *.wav currently in the recordings folder.
@@ -333,6 +418,8 @@ class RecordingManager: ObservableObject {
         timer?.invalidate()
         timer = nil
         isRecording = false
+        isPaused = false
+        pauseReason = ""
         endSleepAssertion()
 
         // Signal Python and wait for it to flush the WAV to disk before processing
@@ -367,6 +454,8 @@ class RecordingManager: ObservableObject {
         timer?.invalidate()
         timer = nil
         isRecording = false
+        isPaused = false
+        pauseReason = ""
         endSleepAssertion()
 
         if let proc, proc.isRunning {
@@ -393,7 +482,10 @@ class RecordingManager: ObservableObject {
         let capturedDiarize = UserDefaults.standard.bool(forKey: "diarizeEnabled")
         let python = Self.pythonPath()
         let diarizeFlag = capturedDiarize ? "--diarize" : "--no-diarize"
-        let cmd = "cd \"\(capturedProjectDir)\" && exec \"\(python)\" -m src.cli process-latest \(diarizeFlag)"
+        // An idea session is processed idea-shaped; reset to meeting for next time.
+        let typeFlag = captureMode == .idea ? " --type idea" : ""
+        captureMode = .meeting
+        let cmd = "cd \"\(capturedProjectDir)\" && exec \"\(python)\" -m src.cli process-latest \(diarizeFlag)\(typeFlag)"
         await runPipeline(cmd: cmd, projectDir: capturedProjectDir)
     }
 
@@ -427,7 +519,9 @@ class RecordingManager: ObservableObject {
         let python = Self.pythonPath()
         let diarizeFlag = capturedDiarize ? "--diarize" : "--no-diarize"
         let escapedPath = path.replacingOccurrences(of: "\"", with: "\\\"")
-        let cmd = "cd \"\(capturedProjectDir)\" && exec \"\(python)\" -m src.cli process \"\(escapedPath)\" \(diarizeFlag)"
+        // Imported files carry no capture mode, so let the pipeline infer meeting
+        // vs idea from the audio's content (--type auto).
+        let cmd = "cd \"\(capturedProjectDir)\" && exec \"\(python)\" -m src.cli process \"\(escapedPath)\" \(diarizeFlag) --type auto"
         return await runPipeline(cmd: cmd, projectDir: capturedProjectDir)
     }
 
@@ -558,14 +652,27 @@ class RecordingManager: ObservableObject {
         processingStage = ""
         processingDetail = ""
         completedStages = []
+        transcribeProgress = -1
         lastError = nil
         statusIcon.image = ScribeApp.processingPillIcon
+
+        // Tick a per-stage elapsed clock so steps without a determinate percentage
+        // (e.g. the single Claude call) still show forward motion.
+        stageStartedAt = Date()
+        stageElapsed = 0
+        processingTimer?.invalidate()
+        processingTimer = Self.makeCommonModeTimer(interval: 1) { [weak self] in
+            guard let self, let started = self.stageStartedAt else { return }
+            self.stageElapsed = Int(Date().timeIntervalSince(started))
+        }
 
         let capturedProjectDir = projectDir
         let (output, exitCode, stderrLog) = await Task.detached { [self] in
             return self.runSubprocessWithProgress(cmd: cmd, projectDir: capturedProjectDir)
         }.value
 
+        processingTimer?.invalidate()
+        processingTimer = nil
         isProcessing = false
         statusIcon.image = ScribeApp.idleMicIcon
 
@@ -650,18 +757,29 @@ class RecordingManager: ObservableObject {
 
         let detail = obj["detail"] as? String ?? ""
         let note = obj["note"] as? String
+        let pct = (obj["pct"] as? NSNumber)?.doubleValue
         Task { @MainActor [weak self] in
             guard let self else { return }
             // The "done" marker carries the saved note's filename so we can offer
             // a correction on exactly this note (not just "the latest").
             if let note, !note.isEmpty { self.lastNoteFile = note }
-            let stageOrder = ["transcribing", "diarizing", "processing", "saving", "done"]
-            if let idx = stageOrder.firstIndex(of: stage), idx > 0 {
-                for i in 0..<idx { self.completedStages.insert(stageOrder[i]) }
+            // Mark every display step *before* the current one done, so collapsed
+            // sub-stages (diarizing/classifying → transcribing) don't prematurely
+            // complete a step or leave a gap with nothing active.
+            let current = Self.displayStepFor[stage] ?? stage
+            if let idx = Self.displayOrder.firstIndex(of: current) {
+                for i in 0..<idx { self.completedStages.insert(Self.displayOrder[i]) }
             }
-            if stage == "done" { self.completedStages.insert("saving") }
+            if stage == "done" { Self.displayOrder.forEach { self.completedStages.insert($0) } }
+            if self.processingStage != stage {   // new stage → restart its elapsed clock
+                self.stageStartedAt = Date()
+                self.stageElapsed = 0
+            }
             self.processingStage = stage
             self.processingDetail = detail
+            // Real transcription progress (parakeet); other stages stay indeterminate.
+            if stage == "transcribing", let pct { self.transcribeProgress = pct / 100.0 }
+            else if stage != "transcribing" { self.transcribeProgress = -1 }
         }
     }
 
@@ -734,11 +852,16 @@ class RecordingManager: ObservableObject {
     /// app's lifecycle (App Nap, process-group signals) and prevents a SIGPIPE death
     /// from the inherited stderr — both of which were killing it, so a browser
     /// refresh would hit a dead port. Any stale instance on the port is replaced.
+    ///
+    /// Runs with `--reload` scoped to the code dirs (src/, web/) so edits to the
+    /// Python or templates are picked up live — without watching notes/ or
+    /// recordings/, where a new note or recording would otherwise restart the server.
     func openDashboard() {
         let python = Self.pythonPath()
         let log = NSTemporaryDirectory() + "scribe-dashboard.log"
         let cmd = "pkill -f 'uvicorn web.app:app --port \(dashboardPort)' 2>/dev/null; sleep 0.3; "
-                + "cd \"\(projectDir)\" && nohup \"\(python)\" -m uvicorn web.app:app --port \(dashboardPort) > \"\(log)\" 2>&1 &"
+                + "cd \"\(projectDir)\" && nohup \"\(python)\" -m uvicorn web.app:app --port \(dashboardPort) "
+                + "--reload --reload-dir src --reload-dir web > \"\(log)\" 2>&1 &"
         _ = runBackgroundShell(cmd)
         // Give uvicorn a moment to bind before opening the browser.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
@@ -859,9 +982,27 @@ class RecordingManager: ObservableObject {
         return String(format: "%02d:%02d", m, s)
     }
 
-    func stepState(for stage: String) -> StepState {
-        if completedStages.contains(stage) { return .done }
-        if processingStage == stage { return .active }
+    // The Python pipeline emits fine-grained stages (importing, transcribing,
+    // diarizing, classifying, processing, saving, done) but the menu shows three
+    // steps. Diarization and auto-classification are post-transcription work, so
+    // they map back onto "transcribing" — otherwise the Transcribing step reads
+    // as done while Extracting is still pending and *nothing* looks active, which
+    // looks frozen even though pyannote is churning away.
+    static let displayStepFor: [String: String] = [
+        "importing": "transcribing",
+        "transcribing": "transcribing",
+        "diarizing": "transcribing",
+        "classifying": "transcribing",
+        "processing": "processing",
+        "saving": "saving",
+        "done": "done",
+    ]
+    static let displayOrder = ["transcribing", "processing", "saving"]
+
+    func stepState(for step: String) -> StepState {
+        if completedStages.contains(step) { return .done }
+        let current = Self.displayStepFor[processingStage] ?? processingStage
+        if current == step { return .active }
         return .pending
     }
 
@@ -882,9 +1023,35 @@ class RecordingManager: ObservableObject {
         p.waitUntilExit()
     }
 
-    static func makeRecordingPillIcon(time: String, bands: [Float] = [], warning: Bool = false) -> NSImage {
-        // Amber when the input has gone quiet (likely dead/muted mic), else red.
-        let fill = warning ? Color(red: 0.92, green: 0.58, blue: 0.0) : Color.red
+    /// A muted pill with a pause glyph, shown while the recording is paused
+    /// (silence auto-pause or a manual pause).
+    static func makePausedPillIcon(time: String) -> NSImage {
+        let view = ZStack {
+            Capsule().fill(Color(red: 0.42, green: 0.42, blue: 0.45))
+            HStack(spacing: 4) {
+                HStack(spacing: 2) {
+                    Capsule().fill(Color.white).frame(width: 2.5, height: 10)
+                    Capsule().fill(Color.white).frame(width: 2.5, height: 10)
+                }
+                Text(time)
+                    .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                    .foregroundColor(.white)
+            }
+        }
+        .frame(width: 74, height: 20)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2.0
+        let img = renderer.nsImage ?? NSImage()
+        img.isTemplate = false
+        return img
+    }
+
+    static func makeRecordingPillIcon(time: String, bands: [Float] = [], warning: Bool = false,
+                                      idea: Bool = false) -> NSImage {
+        // Amber when the input has gone quiet (likely dead/muted mic); otherwise
+        // blue for an idea session and red for a meeting.
+        let fill = warning ? Color(red: 0.92, green: 0.58, blue: 0.0)
+                           : (idea ? Color(red: 0.18, green: 0.45, blue: 0.85) : Color.red)
         let view = ZStack {
             Capsule().fill(fill)
             HStack(spacing: 4) {
